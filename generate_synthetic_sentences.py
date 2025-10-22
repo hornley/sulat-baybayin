@@ -1,16 +1,118 @@
-"""Synthetic sentence generator moved into src/ for reorganization."""
+"""Synthetic sentence generator moved into src/ for reorganization.
+
+This version includes symbol normalization and optional on-disk caching of normalized
+symbols so glyphs with varying sizes / bit-depths produce consistent results.
+"""
 # copy of original generate_synthetic_sentences.py kept here for clarity and use by scripts
-import os, random, csv, argparse
+import os, random, csv, argparse, hashlib
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+
+
+def _exif_transpose(img):
+    # safeguard for orientation metadata
+    try:
+        return ImageOps.exif_transpose(img)
+    except Exception:
+        return img
+
+
+def _percentile_threshold(gray_img, pct=99.0):
+    """Compute a percentile-based threshold (0-255) from a PIL L image without numpy."""
+    hist = gray_img.histogram()  # 256-length list
+    total = sum(hist)
+    if total == 0:
+        return 255
+    cutoff = int(total * (pct / 100.0))
+    cumsum = 0
+    for i, h in enumerate(hist):
+        cumsum += h
+        if cumsum >= cutoff:
+            return i
+    return 255
+
+
+def normalize_symbol_from_image(img, target_height, bg_threshold_pct=99.0, min_size=8, resample=Image.BICUBIC):
+    """Normalize a PIL image to an RGBA glyph of height target_height.
+
+    Returns (rgba_img, mask)
+    """
+    # 1) normalize orientation and convert to RGBA 8-bit
+    im = _exif_transpose(img).convert('RGBA')
+
+    # 2) build mask: prefer existing alpha if present
+    alpha = im.split()[-1]
+    use_mask = None
+    try:
+        if alpha.getbbox() and alpha.getbbox() != (0, 0, im.width, im.height):
+            use_mask = alpha
+    except Exception:
+        use_mask = None
+
+    if use_mask is None:
+        # derive mask from luminance with percentile adaptive threshold
+        gray = im.convert('L')
+        thr = _percentile_threshold(gray, pct=bg_threshold_pct)
+        mask = gray.point(lambda p: 255 if p < thr else 0).convert('L')
+        # smooth small speckles but keep faint strokes (avoid hard re-thresholding)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
+    else:
+        mask = use_mask
+
+    # 3) tight crop
+    bbox = mask.getbbox()
+    if not bbox:
+        bbox = (0, 0, im.width, im.height)
+    cropped = im.crop(bbox)
+    cropped_mask = mask.crop(bbox)
+
+    # 4) resize to target height keeping aspect
+    w, h = cropped.size
+    if h == 0:
+        h = 1
+    scale = float(target_height) / float(h)
+    new_w = max(min_size, int(round(w * scale)))
+    new_h = max(min_size, int(round(h * scale)))
+    resized = cropped.resize((new_w, new_h), resample=resample)
+    resized_mask = cropped_mask.resize((new_w, new_h), resample=Image.NEAREST)
+
+    # 5) keep mask as-is (do not erode) to preserve thin strokes
+    final_mask = resized_mask
+
+    # 6) recompose RGBA using mask as alpha
+    rgb = resized.convert('RGB')
+    rgba = rgb.copy()
+    rgba.putalpha(final_mask)
+
+    return rgba, final_mask
+
+
+def _cache_path_for(img_path, cache_dir, target_height, bg_threshold_pct):
+    # deterministic cache filename based on absolute path and params
+    key = (os.path.abspath(img_path) + f"::h={target_height}|t={bg_threshold_pct}").encode('utf8')
+    h = hashlib.md5(key).hexdigest()
+    base = os.path.splitext(os.path.basename(img_path))[0]
+    return os.path.join(cache_dir, f"{base}_{h}.png")
 
 
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('--count', type=int, default=500)
     p.add_argument('--out-dir', default='sentences_data_synth')
-    p.add_argument('--ann', default='annotations/synthetic_annotations.csv')
+    p.add_argument('--ann', default=None, help='Path to annotation CSV (omit to skip writing annotations)')
     p.add_argument('--min_symbols', type=int, default=3)
     p.add_argument('--max_symbols', type=int, default=8)
+    # normalization options
+    p.add_argument('--symbol-height-frac', type=float, default=0.55, help='Fraction of canvas height to resize symbol to')
+    p.add_argument('--use-cache', action='store_true', help='Cache normalized symbols to disk for faster repeated runs')
+    p.add_argument('--cache-dir', default='.symbol_cache', help='Directory to store normalized symbol cache')
+    p.add_argument('--bg-thresh-pct', type=float, default=99.0, help='Percentile used to decide background luminance cutoff')
+    # erosion options
+    p.add_argument('--erode-shadow', action='store_true', help='Optionally erode mask before generating shadow (preserves glyph alpha)')
+    p.add_argument('--erode-shadow-min-thickness', type=float, default=2.5, help='Minimum estimated stroke thickness (px) required to allow erosion for shadow')
+    p.add_argument('--erode-glyph', action='store_true', help='Optionally erode glyph alpha mask (destructive) when stroke thickness >= threshold')
+    p.add_argument('--erode-glyph-min-thickness', type=float, default=4.0, help='Minimum estimated stroke thickness (px) required to allow glyph erosion')
+    p.add_argument('--erode-shadow-prob', type=float, default=1.0, help='Probability (0..1) to apply shadow erosion when allowed')
+    p.add_argument('--erode-glyph-prob', type=float, default=1.0, help='Probability (0..1) to apply glyph erosion when allowed')
     args = p.parse_args(argv)
 
     ROOT = os.path.abspath('.')
@@ -99,24 +201,35 @@ def main(argv=None):
                     break
                 cls, img_path = item
             class_counts[cls] = class_counts.get(cls, 0) + 1
+            # load original image
             im = Image.open(img_path)
-            # ensure we operate with RGBA; create alpha mask from luminance for RGB/JPEG inputs
-            if im.mode != 'RGBA':
-                # compute mask where ink is present (darker than near-white)
-                gray = im.convert('L')
-                # use a slightly higher threshold so faint strokes aren't lost (include pixels darker than 245)
-                mask = gray.point(lambda p: 255 if p < 245 else 0)
-                im = im.convert('RGBA')
-                im.putalpha(mask)
-            else:
-                # if RGBA but alpha is empty, try to derive from luminance
-                alpha = im.split()[-1]
-                if alpha.getbbox() is None:
-                    gray = im.convert('L')
-                    # same slightly higher threshold for RGBA inputs with empty alpha
-                    mask = gray.point(lambda p: 255 if p < 245 else 0)
-                    im.putalpha(mask)
-        # trim whitespace using alpha channel (tight crop)
+
+            # decide target symbol height from canvas
+            target_h = max(8, int(h_canvas * args.symbol_height_frac))
+
+            # optionally use cached normalized symbol
+            cached = None
+            if args.use_cache:
+                os.makedirs(args.cache_dir, exist_ok=True)
+                cp = _cache_path_for(img_path, args.cache_dir, target_h, args.bg_thresh_pct)
+                if os.path.exists(cp):
+                    try:
+                        im = Image.open(cp).convert('RGBA')
+                        # im is already normalized; mask is its alpha
+                        mask = im.split()[-1]
+                        cached = True
+                    except Exception:
+                        cached = False
+
+            if not cached:
+                rgba, mask = normalize_symbol_from_image(im, target_h, bg_threshold_pct=args.bg_thresh_pct)
+                im = rgba
+                if args.use_cache:
+                    try:
+                        cp = _cache_path_for(img_path, args.cache_dir, target_h, args.bg_thresh_pct)
+                        im.convert('RGBA').save(cp)
+                    except Exception:
+                        pass
             # crop tightly to alpha content, rotate, then recrop to remove any rotation padding
             try:
                 alpha = im.split()[-1]
@@ -154,18 +267,33 @@ def main(argv=None):
             y = max(2, min(h_canvas - im.height - 2, raw_y))
             if im.mode == 'RGBA':
                 mask = im.split()[-1]
-                # very rarely erode the mask to remove white fringes; avoid doing this often because
-                # it can remove thin/faint strokes
-                if random.random() < 0.05:
-                    try:
-                        mask = mask.filter(ImageFilter.MinFilter(3))
-                    except Exception:
-                        pass
-                # create a soft shadow by blurring the mask and pasting a dark translucent layer
+                # keep mask intact to preserve thin/faint strokes (no erosion)
+                # create a soft shadow by blurring an eroded mask and pasting a dark translucent layer
                 try:
-                    # blur the mask for the shadow only so the shadow stays soft but
-                    # doesn't occlude thin strokes too much
-                    mask_blur = mask.filter(ImageFilter.GaussianBlur(radius=2))
+                    # decide whether to erode the mask for shadow based on user flag
+                    # and a simple stroke-thickness heuristic to avoid deleting thin strokes
+                    shadow_mask = mask
+                    if args.erode_shadow and random.random() < float(args.erode_shadow_prob):
+                        try:
+                            # estimate stroke thickness: use area / avg_dim heuristic
+                            bbox = mask.getbbox()
+                            if bbox:
+                                area = float(sum(mask.histogram()[255:256]) if False else mask.convert('L').point(lambda p: 1 if p>0 else 0).histogram()[1])
+                                # fallback heuristic: area pixels divided by average of width/height
+                                w_m, h_m = mask.width, mask.height
+                                avg_dim = max(1.0, (w_m + h_m) / 2.0)
+                                est_thickness = max(0.0, float(area) / avg_dim)
+                            else:
+                                est_thickness = 0.0
+                        except Exception:
+                            est_thickness = 0.0
+                        # apply erosion only if estimated thickness is above threshold
+                        if est_thickness >= float(args.erode_shadow_min_thickness):
+                            try:
+                                shadow_mask = mask.filter(ImageFilter.MinFilter(3))
+                            except Exception:
+                                shadow_mask = mask
+                    mask_blur = shadow_mask.filter(ImageFilter.GaussianBlur(radius=2))
                     # reduce shadow opacity to avoid darkening fine strokes
                     shadow = Image.new('RGBA', im.size, (0, 0, 0, 80))
                     bg.paste(shadow, (x + 2, y + 2), mask_blur)
@@ -173,6 +301,19 @@ def main(argv=None):
                     mask_blur = mask
                 # optionally darken the glyph slightly to vary ink intensity
                 try:
+                    # compute a simple stroke-thickness estimate once and reuse
+                    try:
+                        bbox = mask.getbbox()
+                        if bbox:
+                            area = float(mask.convert('L').point(lambda p: 1 if p>0 else 0).histogram()[1])
+                            w_m, h_m = mask.width, mask.height
+                            avg_dim = max(1.0, (w_m + h_m) / 2.0)
+                            est_thickness = max(0.0, float(area) / avg_dim)
+                        else:
+                            est_thickness = 0.0
+                    except Exception:
+                        est_thickness = 0.0
+
                     glyph = im.convert('RGBA')
                     # occasionally darken slightly but avoid strong darkening that removes detail
                     if random.random() < 0.35:
@@ -181,9 +322,17 @@ def main(argv=None):
                         rgb = glyph.convert('RGB')
                         rgb = ImageEnhance.Brightness(rgb).enhance(factor)
                         glyph = rgb.convert('RGBA')
-                        glyph.putalpha(mask)
-                    # paste glyph using the original mask to preserve thin/faint strokes
-                    bg.paste(glyph, (x, y), mask)
+
+                    # determine which mask to use for glyph paste (may erode if user allows)
+                    paste_mask = mask
+                    if args.erode_glyph and est_thickness >= float(args.erode_glyph_min_thickness) and random.random() < float(args.erode_glyph_prob):
+                        try:
+                            paste_mask = mask.filter(ImageFilter.MinFilter(3))
+                        except Exception:
+                            paste_mask = mask
+
+                    glyph.putalpha(paste_mask)
+                    bg.paste(glyph, (x, y), paste_mask)
                 except Exception:
                     bg.paste(im, (x, y), mask)
             else:
@@ -213,16 +362,21 @@ def main(argv=None):
         fname = os.path.join(IMG_DIR, f'img_{i:05d}.png')
         final.save(fname)
 
-    # write CSV
-    os.makedirs(os.path.dirname(args.ann), exist_ok=True)
-    with open(args.ann, 'w', newline='', encoding='utf8') as f:
+    # determine annotation output path: if user didn't provide --ann, save inside the out-dir
+    if args.ann is None:
+        ann_path = os.path.join(OUT, 'annotations.csv')
+    else:
+        ann_path = args.ann
+
+    os.makedirs(os.path.dirname(ann_path), exist_ok=True)
+    with open(ann_path, 'w', newline='', encoding='utf8') as f:
         w = csv.writer(f)
         w.writerow(['image_path','x1','y1','x2','y2','label'])
         for r in rows:
             w.writerow(r)
+    print('Wrote annotations to', ann_path)
 
     print('Wrote', args.count, 'synthetic images to', IMG_DIR)
-    print('Wrote annotations to', args.ann)
 
 
 if __name__ == '__main__':

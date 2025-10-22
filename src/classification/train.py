@@ -136,7 +136,6 @@ def main():
     # optionally resume (load model and optimizer state if requested)
     start_epoch = 0
     if getattr(args, 'resume', None):
-        import os
         if os.path.exists(args.resume):
             ckpt = torch.load(args.resume, map_location=device)
             if 'model_state' in ckpt:

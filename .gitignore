@@ -5,5 +5,8 @@
 /single_symbol_testing
 /annotations
 /detections
-/tools
 /detection_synth_test1
+/debug_test
+/src/classification/__pycache__
+/src/detection/__pycache__
+/src/shared/__pycache__

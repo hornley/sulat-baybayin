@@ -1,10 +1,10 @@
 import argparse
 import torch
 import torchvision
-from detection_dataset import BBoxDataset
+from src.detection.dataset import BBoxDataset
 from torch.utils.data import DataLoader
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from src.train_args import add_common_training_args, dataloader_kwargs_from_args
+from src.shared.train_args import add_common_training_args, dataloader_kwargs_from_args
 
 
 def get_model(num_classes, weights=None):
