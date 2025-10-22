@@ -4,6 +4,7 @@ import torchvision
 from detection_dataset import BBoxDataset
 from torch.utils.data import DataLoader
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from src.train_args import add_common_training_args, dataloader_kwargs_from_args
 
 
 def get_model(num_classes, weights=None):
@@ -22,36 +23,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', default='data_sentences', help='Image root')
     parser.add_argument('--ann', required=True, help='Annotation CSV or COCO JSON')
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch', type=int, default=4)
-    parser.add_argument('--out', default='checkpoints/detection')
+    add_common_training_args(parser)
+    # detection-specific defaults: keep a smaller default batch size
+    parser.set_defaults(batch=4, num_workers=4, prefetch_factor=2, out='checkpoints/detection')
     # optimizer / training options
-    parser.add_argument('--lr', type=float, default=0.005, help='Base learning rate')
     parser.add_argument('--momentum', type=float, default=0.9)
-    parser.add_argument('--weight-decay', type=float, default=0.0005)
     parser.add_argument('--lr-backbone', type=float, default=None, help='Optional LR for backbone params')
     parser.add_argument('--lr-head', type=float, default=None, help='Optional LR for head params')
     parser.add_argument('--freeze-backbone', action='store_true', help='Freeze backbone parameters')
     parser.add_argument('--schedule', choices=['step', 'cosine', 'none'], default='step')
     parser.add_argument('--lr-step', type=int, default=3)
     parser.add_argument('--lr-gamma', type=float, default=0.1)
-    parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--early-stop', type=int, default=0, help='Early stopping patience in epochs (0 to disable)')
+    # resume path provided by shared args
+    # early-stop is provided by shared args
     parser.add_argument('--val-ann', default=None, help='Optional separate annotation file for validation')
-    # dataloader options
-    parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--pin-memory', action='store_true')
-    parser.add_argument('--prefetch-factor', type=int, default=2)
+    # dataloader options (provided by shared args)
     # evaluation / performance
     parser.add_argument('--no-batch-eval', action='store_true', help='Disable per-batch quick eval during training')
-    parser.add_argument('--amp', action='store_true', help='Enable mixed-precision (if available)')
+    args = parser.parse_args()
+
     args = parser.parse_args()
 
     ds = BBoxDataset(args.data, ann_file=args.ann)
     classes = ds.classes
     print('Found classes:', classes)
-    loader = DataLoader(ds, batch_size=args.batch, shuffle=True, collate_fn=collate_fn,
-                        num_workers=args.num_workers, pin_memory=args.pin_memory, prefetch_factor=args.prefetch_factor)
+    # build DataLoader kwargs from shared args
+    dl_kw = dataloader_kwargs_from_args(args)
+    # For detection we need shuffle=True and collate_fn
+    loader = DataLoader(ds, shuffle=True, collate_fn=collate_fn, **dl_kw)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = get_model(num_classes=len(classes)+1)
@@ -111,12 +110,17 @@ def main():
             if 'model_state' in ckpt:
                 model.load_state_dict(ckpt['model_state'])
                 print('Loaded model state from', args.resume)
-            if 'optimizer_state' in ckpt and 'optimizer' in locals():
+            if args.resume_optimizer and 'optimizer_state' in ckpt and 'optimizer' in locals():
                 try:
                     optimizer.load_state_dict(ckpt['optimizer_state'])
+                    # move optimizer tensors to correct device
+                    for state in optimizer.state.values():
+                        for k, v in list(state.items()):
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.to(device)
                     print('Loaded optimizer state from', args.resume)
                 except Exception:
-                    print('Could not load optimizer state (optimizer mismatch)')
+                    print('Could not load optimizer state (optimizer/model mismatch)')
             if 'epoch' in ckpt:
                 start_epoch = ckpt['epoch'] + 1
         else:
