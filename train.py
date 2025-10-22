@@ -1,9 +1,9 @@
 """
-Top-level compatibility wrapper for the project. Delegate CLI handling to src.train.main()
-so that new options added in src/train.py are always available when running `python train.py`.
+Top-level compatibility wrapper for classification training.
+Delegates to src.classification.train.main()
 """
 
-from src.train import main
+from src.classification.train import main
 
 
 if __name__ == '__main__':

@@ -4,10 +4,10 @@ import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from src.dataset import make_dataloaders
-from src.model import BaybayinClassifier
-from src.utils import save_checkpoint, load_checkpoint
-from src.train_args import add_common_training_args, dataloader_kwargs_from_args
+from src.classification.dataset import make_dataloaders
+from src.classification.model import BaybayinClassifier
+from src.shared.utils import save_checkpoint
+from src.shared.train_args import add_common_training_args, dataloader_kwargs_from_args
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
@@ -20,7 +20,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
         labels = labels.to(device)
         optimizer.zero_grad()
         if scaler is not None:
-            # use torch.amp.autocast with explicit device string for clarity
             dev = device if isinstance(device, str) else device.type
             with torch.amp.autocast(device_type=dev):
                 outputs = model(imgs)
@@ -81,7 +80,6 @@ def main():
 
     # build dataloaders with DataLoader kwargs from common args
     dl_kwargs = dataloader_kwargs_from_args(args)
-    # make_dataloaders expects batch_size and returns DataLoaders; we pass batch_size explicitly
     train_loader, val_loader, classes = make_dataloaders(args.data, batch_size=dl_kwargs.get('batch_size', args.batch), img_size=args.img_size, augment=args.augment, min_count=args.min_count,)
 
     # map weights option to torchvision enum when available
@@ -94,26 +92,21 @@ def main():
             else:
                 weights_arg = ResNet18_Weights.DEFAULT
         except Exception:
-            # older torchvision: can't use enum API; set weights_arg to None so model uses random init
             weights_arg = None
 
     model = BaybayinClassifier(num_classes=len(classes), weights=weights_arg)
     model = model.to(device)
 
     if args.freeze_backbone:
-        # Freeze all backbone parameters except the final fully-connected layer (backbone.fc)
         for name, param in model.backbone.named_parameters():
             if name.startswith('fc.'):
                 continue
             param.requires_grad = False
 
     criterion = nn.CrossEntropyLoss()
-    # AMP support: use new torch.amp API and create scaler if requested and device is cuda
-    scaler = torch.amp.GradScaler('cuda') if (args.amp and (device == 'cuda' or (not isinstance(device, str) and device.type == 'cuda'))) else None
-    # build optimizer param groups (support discriminative LR for backbone/head)
+    scaler = torch.amp.GradScaler() if (args.amp and (device == 'cuda' or (not isinstance(device, str) and device.type == 'cuda'))) else None
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     param_groups = None
-    # if user specified backbone/head LR, create groups
     if args.lr_backbone is not None or args.lr_head is not None:
         backbone_params = []
         head_params = []
@@ -126,7 +119,6 @@ def main():
                     if p.requires_grad:
                         backbone_params.append(p)
         except Exception:
-            # fallback: split by parameter shape/name unknown
             backbone_params = [p for p in model.parameters() if p.requires_grad]
             head_params = []
 
@@ -153,7 +145,6 @@ def main():
             if args.resume_optimizer and 'optimizer_state' in ckpt:
                 try:
                     optimizer.load_state_dict(ckpt['optimizer_state'])
-                    # move optimizer state tensors to correct device
                     for state in optimizer.state.values():
                         for k, v in list(state.items()):
                             if isinstance(v, torch.Tensor):
@@ -188,7 +179,6 @@ def main():
         # scheduler step
         if scheduler is not None:
             try:
-                # ReduceLROnPlateau requires the val metric
                 if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     scheduler.step(val_loss)
                 else:

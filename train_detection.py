@@ -286,5 +286,8 @@ def main():
             print(f'Early stopping: no improvement in val_loss for {args.early_stop} epochs')
             break
 
+from src.detection.train import main
+
+
 if __name__ == '__main__':
     main()
