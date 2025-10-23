@@ -4,6 +4,8 @@ import time
 import torch
 import torchvision
 import torchvision.transforms as T
+import random
+import sys
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from src.detection.dataset import BBoxDataset
 from src.shared.train_args import add_common_training_args, dataloader_kwargs_from_args
@@ -121,6 +123,7 @@ def main():
     parser.add_argument('--data', required=True, help='Image root folder')
     parser.add_argument('--ann', required=True, help='CSV or COCO annotations file')
     add_common_training_args(parser)
+    parser.add_argument('--save-last', action='store_true', help='Save last epoch checkpoint to last.pth (won\'t overwrite best.pth)')
     # detection-specific optimizer / training options
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--lr-backbone', type=float, default=None, help='Optional LR for backbone params')
@@ -135,11 +138,16 @@ def main():
     parser.add_argument('--real-data', default=None, help='Root folder for photographed/real images to mix with synthetic')
     parser.add_argument('--real-ann', default=None, help='Annotations CSV/COCO for real images')
     parser.add_argument('--real-weight', type=float, default=0.2, help='Fraction of samples from real data per epoch (0-1)')
+    parser.add_argument('--mix-strategy', choices=['concat', 'alternating', 'quotas'], default='quotas', help='How to mix synthetic and real datasets')
     # early stopping options
     parser.add_argument('--early-stop-patience', type=int, default=0, help='Number of epochs with no improvement after which training will be stopped (0 disables)')
     parser.add_argument('--early-stop-min-delta', type=float, default=0.0, help='Minimum change in monitored metric to qualify as improvement')
     parser.add_argument('--early-stop-monitor', choices=['val_loss', 'train_loss', 'acc'], default='val_loss', help='Metric to monitor for early stopping')
     args = parser.parse_args()
+
+    # If user asked to monitor val_loss but didn't provide a validation annotation file, warn them
+    if args.early_stop_monitor == 'val_loss' and not args.val_ann:
+        print('Warning: --early-stop-monitor val_loss selected but no --val-ann provided; val_loss will be None and early-stopping on val_loss will be disabled.', file=sys.stderr)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dl_kwargs = dataloader_kwargs_from_args(args)
@@ -178,23 +186,73 @@ def main():
                 raise IndexError
 
         combined = ConcatIndexDataset([train_ds, real_ds])
-
-        # build sampling weights so that approx real_weight fraction comes from real_ds
         n_synth = len(train_ds)
         n_real = len(real_ds)
         assert n_synth > 0 and n_real > 0, 'Both synthetic and real datasets must be non-empty'
-        w_real = float(args.real_weight)
-        w_synth = max(0.0, 1.0 - w_real)
-        # per-sample weight: synthetic samples get w_synth/n_synth, real get w_real/n_real
-        import torch as _torch
-        weights = _torch.zeros(n_synth + n_real, dtype=_torch.double)
-        if n_synth:
-            weights[:n_synth] = w_synth / n_synth
-        if n_real:
-            weights[n_synth:] = w_real / n_real
 
-        sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(combined), replacement=True)
-        train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn, **dl_kwargs_local)
+        # mixing strategies
+        if args.mix_strategy == 'concat':
+            # simple concatenation: synthetic then real; shuffle controlled by dataloader shuffle
+            train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
+            mix_log_path = os.path.join(args.out, 'mix_log_concat.csv')
+        elif args.mix_strategy == 'alternating':
+            # alternating batches: construct an index list where batches alternate between datasets
+            # Build indices for each dataset and then interleave batch blocks
+            synth_indices = list(range(0, n_synth))
+            real_indices = list(range(n_synth, n_synth + n_real))
+            # shuffle inside each set
+            random.shuffle(synth_indices)
+            random.shuffle(real_indices)
+            # build an interleaved index list of length = len(combined)
+            idxs = []
+            si = 0; ri = 0
+            toggle = True
+            while si < len(synth_indices) or ri < len(real_indices):
+                if toggle and si < len(synth_indices):
+                    idxs.append(synth_indices[si]); si += 1
+                elif not toggle and ri < len(real_indices):
+                    idxs.append(real_indices[ri]); ri += 1
+                else:
+                    # drain remaining
+                    if si < len(synth_indices):
+                        idxs.append(synth_indices[si]); si += 1
+                    if ri < len(real_indices):
+                        idxs.append(real_indices[ri]); ri += 1
+                toggle = not toggle
+            from torch.utils.data import Subset
+            train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, sampler=torch.utils.data.sampler.SequentialSampler(idxs), collate_fn=collate_fn, **dl_kwargs_local)
+            mix_log_path = os.path.join(args.out, 'mix_log_alternating.csv')
+        else:
+            # quotas: deterministic per-epoch quotas without replacement
+            total = len(combined)
+            # calculate quotas per epoch
+            real_quota = int(round(args.real_weight * total))
+            synth_quota = total - real_quota
+            # sample without replacement deterministically each epoch: we'll create a list of indices for one epoch
+            synth_indices = list(range(0, n_synth))
+            real_indices = list(range(n_synth, n_synth + n_real))
+            random.shuffle(synth_indices)
+            random.shuffle(real_indices)
+            # take quotas, if we run out, wrap around (but within epoch keep counts exact)
+            chosen = []
+            si = 0
+            ri = 0
+            for _ in range(synth_quota):
+                if si >= len(synth_indices):
+                    si = 0
+                    random.shuffle(synth_indices)
+                chosen.append(synth_indices[si]); si += 1
+            for _ in range(real_quota):
+                if ri >= len(real_indices):
+                    ri = 0
+                    random.shuffle(real_indices)
+                chosen.append(real_indices[ri]); ri += 1
+            # shuffle final chosen order to mix within epoch but quotas satisfied
+            random.shuffle(chosen)
+            from torch.utils.data import Subset
+            epoch_subset = Subset(combined, chosen)
+            train_loader = torch.utils.data.DataLoader(epoch_subset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, **dl_kwargs_local)
+            mix_log_path = os.path.join(args.out, 'mix_log_quotas.csv')
     else:
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
 
@@ -270,8 +328,28 @@ def main():
     else:
         lr_scheduler = None
 
+    # prepare mix logging
+    mix_log = []
     for epoch in range(start_epoch, args.epochs):
         avg_total, avg_cls, avg_box, matched, total_gt, elapsed = train_one_epoch(model, optimizer, train_loader, device, epoch, scaler=scaler, skip_batch_eval=args.no_batch_eval)
+        # if using quotas strategy we recorded a subset; compute how many samples from each source were used
+        if args.real_data and args.real_ann and args.mix_strategy in ('alternating', 'quotas'):
+            # count how many samples in the current train_loader came from real vs synth by inspecting dataset indices if available
+            try:
+                # for SequentialSampler or Subset, inspect underlying indices
+                indices_used = []
+                if hasattr(train_loader.dataset, 'indices'):
+                    indices_used = list(train_loader.dataset.indices)
+                elif hasattr(train_loader.batch_sampler, 'sampler') and hasattr(train_loader.batch_sampler.sampler, 'data_source'):
+                    # fallback; may not be necessary
+                    indices_used = list(range(len(train_loader.dataset)))
+                else:
+                    indices_used = []
+                n_real_used = sum(1 for idx in indices_used if idx >= n_synth)
+                n_synth_used = sum(1 for idx in indices_used if idx < n_synth)
+                mix_log.append({'epoch': epoch, 'n_synth': n_synth_used, 'n_real': n_real_used})
+            except Exception:
+                pass
         acc = matched / total_gt if total_gt else 0.0
         # print baseline epoch training summary; validation printed below if present
         print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} time={elapsed:.1f}s')
@@ -357,7 +435,24 @@ def main():
             except Exception:
                 pass
 
-        save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'best.pth'))
+        # Do not overwrite best.pth unconditionally. Save `last.pth` only when requested.
+        if args.save_last:
+            save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'last.pth'))
+            print('Saved last.pth')
+
+    # write mix log if collected
+    try:
+        if 'mix_log' in locals() and len(mix_log) and 'mix_log_path' in locals():
+            import csv as _csv
+            os.makedirs(os.path.dirname(mix_log_path), exist_ok=True)
+            with open(mix_log_path, 'w', newline='', encoding='utf8') as mf:
+                w = _csv.writer(mf)
+                w.writerow(['epoch', 'n_synth', 'n_real'])
+                for r in mix_log:
+                    w.writerow([r.get('epoch'), r.get('n_synth'), r.get('n_real')])
+            print('Wrote mix log to', mix_log_path)
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':

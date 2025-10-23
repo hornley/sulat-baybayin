@@ -12,3 +12,4 @@
 /sentences_data_synth_test
 .DS_Store
 /src/classification/__pycache__
+/tools/__pycache__

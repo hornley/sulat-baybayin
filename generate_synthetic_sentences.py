@@ -113,6 +113,13 @@ def main(argv=None):
     p.add_argument('--erode-glyph-min-thickness', type=float, default=4.0, help='Minimum estimated stroke thickness (px) required to allow glyph erosion')
     p.add_argument('--erode-shadow-prob', type=float, default=1.0, help='Probability (0..1) to apply shadow erosion when allowed')
     p.add_argument('--erode-glyph-prob', type=float, default=1.0, help='Probability (0..1) to apply glyph erosion when allowed')
+    # paper line styling
+    p.add_argument('--paper-lines-prob', type=float, default=0.0, help='Probability (0..1) to overlay ruled-paper lines on generated images')
+    p.add_argument('--line-spacing', type=int, default=28, help='Pixel spacing between ruled lines')
+    p.add_argument('--line-opacity', type=int, default=40, help='Alpha opacity for ruled lines (0-255)')
+    p.add_argument('--line-thickness', type=int, default=1, help='Line thickness in pixels')
+    p.add_argument('--line-jitter', type=int, default=2, help='Vertical jitter per line in pixels')
+    p.add_argument('--line-color', type=str, default='0,0,0', help='RGB color for lines as comma-separated ints, e.g. 0,0,0')
     args = p.parse_args(argv)
 
     ROOT = os.path.abspath('.')
@@ -360,6 +367,21 @@ def main(argv=None):
         except Exception:
             final = final.convert('RGB')
         fname = os.path.join(IMG_DIR, f'img_{i:05d}.png')
+        # optionally overlay paper lines for realism
+        if args.paper_lines_prob and args.paper_lines_prob > 0.0:
+            try:
+                from src.shared.augmentations import overlay_paper_lines_pil
+                if random.random() < float(args.paper_lines_prob):
+                    # parse color
+                    try:
+                        color = tuple(int(x) for x in args.line_color.split(','))
+                        if len(color) != 3:
+                            color = (0,0,0)
+                    except Exception:
+                        color = (0,0,0)
+                    final = overlay_paper_lines_pil(final, line_color=color, line_opacity=int(args.line_opacity), line_spacing=int(args.line_spacing), line_thickness=int(args.line_thickness), jitter=int(args.line_jitter))
+            except Exception:
+                pass
         final.save(fname)
 
     # determine annotation output path: if user didn't provide --ann, save inside the out-dir
