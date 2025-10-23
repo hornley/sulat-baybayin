@@ -19,7 +19,8 @@ def load_checkpoint(path, device='cpu'):
     return model, classes
 
 
-def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5):
+def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
+                     y_thresh_mult=0.5, x_thresh_mult=0.6, min_thresh_px=10):
     img = Image.open(img_path).convert('RGB')
     import torchvision.transforms as T
     tensor = T.ToTensor()(img).to(device)
@@ -27,14 +28,136 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5):
         outputs = model([tensor])
     out = outputs[0]
     draw = ImageDraw.Draw(img)
+    preds = []  # list of dicts with box, centers, size, label_name, score
     for box, label, score in zip(out['boxes'], out['labels'], out['scores']):
         if score < thresh:
             continue
         x1, y1, x2, y2 = map(float, box)
+        w = x2 - x1
+        h = y2 - y1
+        xc = x1 + w / 2.0
+        yc = y1 + h / 2.0
         cname = classes[label - 1] if label > 0 and label - 1 < len(classes) else str(int(label))
         draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
         draw.text((x1 + 3, y1 + 3), f"{cname}:{score:.2f}", fill='red')
-    return img
+        preds.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'xc': xc, 'yc': yc, 'w': w, 'h': h, 'label': cname, 'score': float(score)})
+
+    # If no preds, return empty
+    if not preds:
+        return img, [], ''
+
+    # compute average sizes to set clustering thresholds
+    avg_h = sum(p['h'] for p in preds) / len(preds)
+    avg_w = sum(p['w'] for p in preds) / len(preds)
+
+    # cluster into lines by y-center (top -> down)
+    preds_sorted_y = sorted(preds, key=lambda p: p['yc'])
+    lines = []  # list of lists of preds
+    current_line = [preds_sorted_y[0]]
+    for p in preds_sorted_y[1:]:
+        if abs(p['yc'] - current_line[-1]['yc']) > max(y_thresh_mult * avg_h, min_thresh_px):
+            lines.append(current_line)
+            current_line = [p]
+        else:
+            current_line.append(p)
+    lines.append(current_line)
+
+    # within each line, cluster by x to form symbol positions (left->right)
+    import itertools
+    all_line_permutations = []  # list of lists-of-candidate-labels per line
+    annotated_positions = []
+    for line in lines:
+        # sort by x center
+        line_sorted = sorted(line, key=lambda q: q['xc'])
+        positions = []  # each position is list of preds (alternatives)
+        current_pos = [line_sorted[0]]
+        for q in line_sorted[1:]:
+            if abs(q['xc'] - current_pos[-1]['xc']) > max(x_thresh_mult * avg_w, min_thresh_px):
+                positions.append(current_pos)
+                current_pos = [q]
+            else:
+                current_pos.append(q)
+        positions.append(current_pos)
+
+        # for each position, get candidate labels ordered by score desc
+        line_candidates = []
+        for pos in positions:
+            sorted_pos = sorted(pos, key=lambda r: r['score'], reverse=True)
+            labels = [r['label'] for r in sorted_pos]
+            line_candidates.append(labels)
+        all_line_permutations.append(line_candidates)
+        # keep positions for per-image text output with coords
+        annotated_positions.append(positions)
+
+    # produce sentence permutations: Cartesian product of choices per position within each line,
+    # then join lines top->down with ' <NL> '
+    line_permutation_strings = []  # list of lists (each list contains permutations for that line)
+    for line_choices in all_line_permutations:
+        # line_choices: list of lists of labels for that line positions
+        # produce all combinations for this line
+        combos = list(itertools.product(*line_choices)) if line_choices else [()]
+        line_strings = [' '.join(c) for c in combos]
+        line_permutation_strings.append(line_strings)
+
+    # Now combine lines (top->down). For each combination pick one permutation per line and join with ' <NL> '
+    overall_sentences = []
+    for prod in itertools.product(*line_permutation_strings):
+        overall_sentences.append(' <NL> '.join(prod))
+
+    # Score permutations: approximate by summing the score of the chosen candidate per position.
+    # We'll need to map label choices back to position candidate scores.
+    # Build per-line per-position candidate score lists in the same shape as all_line_permutations
+    per_line_pos_scores = []
+    for positions in annotated_positions:
+        line_scores = []
+        for pos in positions:
+            sorted_pos = sorted(pos, key=lambda r: r['score'], reverse=True)
+            scores = [r['score'] for r in sorted_pos]
+            line_scores.append(scores)
+        per_line_pos_scores.append(line_scores)
+
+    # helper to compute sentence score for a chosen combination per line
+    import math
+    def score_sentence_by_choice(line_choice_lists):
+        # line_choice_lists: list (per line) of chosen labels tuple for positions
+        total = 0.0
+        for li, chosen in enumerate(line_choice_lists):
+            # for each position, find the candidate index for the chosen label and add its score
+            positions = annotated_positions[li]
+            for pi, lab in enumerate(chosen):
+                # find matching candidate in positions[pi]
+                candidates = positions[pi]
+                matched = None
+                for c in candidates:
+                    if c['label'] == lab:
+                        matched = c
+                        break
+                if matched is not None:
+                    total += matched['score']
+                else:
+                    # penalty if label not found (shouldn't happen)
+                    total -= 0.5
+        return total
+
+    # evaluate all overall_sentences and pick best by score
+    best_sentence = ''
+    sentence_scores = []
+    if overall_sentences:
+        # To re-create the chosen labels per line for each overall sentence,
+        # split by ' <NL> ' then split per-line string into tokens
+        for s in overall_sentences:
+            per_line = [ln.split() if ln.strip() != '' else [] for ln in s.split(' <NL> ')]
+            sc = score_sentence_by_choice(per_line)
+            sentence_scores.append((sc, s))
+        # pick highest score
+        sentence_scores.sort(key=lambda x: x[0], reverse=True)
+        best_sentence = sentence_scores[0][1]
+
+    # prepare preds_sorted as list of (x1,label,score) for compatibility
+    flat_preds_sorted = sorted(preds, key=lambda x: (x['yc'], x['xc']))
+    preds_sorted = [(p['x1'], p['label'], p['score']) for p in flat_preds_sorted]
+
+    return img, preds_sorted, best_sentence, overall_sentences, annotated_positions
 
 
 def main():
@@ -43,6 +166,11 @@ def main():
     parser.add_argument('--input', required=True, help='Image file or folder')
     parser.add_argument('--out', default='detections')
     parser.add_argument('--thresh', type=float, default=0.5)
+    parser.add_argument('--no-permutations', action='store_true', help='Do not write all permutations to per-image txt')
+    parser.add_argument('--global-format', choices=['txt', 'csv', 'json'], default='txt', help='Format for global predictions file')
+    parser.add_argument('--y-thresh-mult', type=float, default=0.5, help='Multiplier for y clustering threshold (relative to avg height)')
+    parser.add_argument('--x-thresh-mult', type=float, default=0.6, help='Multiplier for x clustering threshold (relative to avg width)')
+    parser.add_argument('--min-thresh-px', type=int, default=10, help='Minimum pixel threshold for clustering')
     args = parser.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, classes = load_checkpoint(args.ckpt, device=device)
@@ -55,10 +183,63 @@ def main():
                 paths.append(os.path.join(args.input, f))
     else:
         paths = [args.input]
+    # global predictions file
+    global_preds_path = os.path.join(args.out, 'predictions.txt')
+    # prepare global predictions writer depending on format
+    import json, csv
+    if args.global_format == 'txt':
+        gfh = open(global_preds_path, 'w', encoding='utf8')
+        write_global = lambda name, sent: gfh.write(f"{name}\t{sent}\n")
+    elif args.global_format == 'csv':
+        gfh = open(global_preds_path, 'w', encoding='utf8', newline='')
+        gcsv = csv.writer(gfh)
+        gcsv.writerow(['image', 'best_sentence'])
+        write_global = lambda name, sent: gcsv.writerow([name, sent])
+    else:
+        # json: accumulate and write at the end
+        g_entries = []
+        write_global = lambda name, sent: g_entries.append({'image': name, 'best_sentence': sent})
+
     for p in paths:
-        out = draw_predictions(p, model, classes, device=device, thresh=args.thresh)
-        out.save(os.path.join(args.out, os.path.basename(p)))
-        print('wrote', os.path.join(args.out, os.path.basename(p)))
+        img_out, preds_sorted, best_sentence, overall_sentences, annotated_positions = draw_predictions(
+            p, model, classes, device=device, thresh=args.thresh,
+            y_thresh_mult=args.y_thresh_mult, x_thresh_mult=args.x_thresh_mult, min_thresh_px=args.min_thresh_px
+        )
+        out_img_path = os.path.join(args.out, os.path.basename(p))
+        img_out.save(out_img_path)
+        print('wrote', out_img_path)
+        # write per-image text file with label and score
+        base = os.path.splitext(os.path.basename(p))[0]
+        txt_path = os.path.join(args.out, base + '.txt')
+        with open(txt_path, 'w', encoding='utf8') as fh:
+            for x1, cname, score in preds_sorted:
+                fh.write(f"{cname}\t{score:.4f}\n")
+            fh.write('\n')
+            fh.write('BEST_SENTENCE:\n')
+            fh.write(best_sentence + '\n')
+            fh.write('\n')
+            if not args.no_permutations:
+                fh.write('PERMUTATIONS:\n')
+                for s in overall_sentences:
+                    fh.write(s + '\n')
+            fh.write('\n')
+            fh.write('POSITIONS (per-line, left->right, with candidates):\n')
+            # annotated_positions is list of lines -> list of positions -> list of preds
+            for li, line in enumerate(annotated_positions):
+                fh.write(f'Line {li+1}:\n')
+                for pi, pos in enumerate(line):
+                    labels = [pp['label'] for pp in sorted(pos, key=lambda r: r['score'], reverse=True)]
+                    fh.write(f'  Pos {pi+1}: ' + ','.join(labels) + '\n')
+        # append to global predictions file / structure
+        write_global(os.path.basename(p), best_sentence)
+
+    # finalize json if needed
+    if args.global_format == 'json':
+        with open(global_preds_path, 'w', encoding='utf8') as gj:
+            json.dump(g_entries, gj, ensure_ascii=False, indent=2)
+    else:
+        gfh.close()
+    print('wrote', global_preds_path)
 
 
 if __name__ == '__main__':

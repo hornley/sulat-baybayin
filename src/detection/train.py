@@ -106,8 +106,8 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10,
             finally:
                 model.train()
 
-        if i % print_freq == 0:
-            print(f'Epoch[{epoch}] Iter[{i}/{len(data_loader)}] Loss: {losses.item():.4f}')
+        # if i % print_freq == 0:
+        #     print(f'Epoch[{epoch}] Iter[{i}/{len(data_loader)}] Loss: {losses.item():.4f}')
 
     elapsed = time.time() - t0
     avg_total = total_loss / n_batches if n_batches else 0.0
@@ -131,6 +131,10 @@ def main():
     parser.add_argument('--lr-gamma', type=float, default=0.1)
     parser.add_argument('--val-ann', default=None, help='Optional separate annotation file for validation')
     parser.add_argument('--no-batch-eval', action='store_true', help='Disable per-batch quick eval during training')
+    # early stopping options
+    parser.add_argument('--early-stop-patience', type=int, default=0, help='Number of epochs with no improvement after which training will be stopped (0 disables)')
+    parser.add_argument('--early-stop-min-delta', type=float, default=0.0, help='Minimum change in monitored metric to qualify as improvement')
+    parser.add_argument('--early-stop-monitor', choices=['val_loss', 'train_loss', 'acc'], default='val_loss', help='Metric to monitor for early stopping')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -247,6 +251,55 @@ def main():
         if val_loss is not None:
             print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} val_loss={val_loss:.4f} time={elapsed:.1f}s')
             model.train()
+
+        # determine monitored metric for early stopping
+        monitored = None
+        if args.early_stop_monitor == 'val_loss':
+            monitored = val_loss if val_loss is not None else None
+        elif args.early_stop_monitor == 'train_loss':
+            monitored = avg_total
+        elif args.early_stop_monitor == 'acc':
+            monitored = acc
+
+        # early stopping bookkeeping
+        if epoch == start_epoch:
+            best_monitored = None
+            best_epoch = epoch
+            epochs_no_improve = 0
+        # initialize best_monitored on first available value
+        if 'best_monitored' not in locals() or best_monitored is None:
+            if monitored is not None:
+                best_monitored = monitored
+                best_epoch = epoch
+                epochs_no_improve = 0
+
+        # check improvement
+        if args.early_stop_patience and monitored is not None:
+            improved = False
+            if args.early_stop_monitor == 'acc':
+                if monitored > (best_monitored + args.early_stop_min_delta):
+                    improved = True
+            else:
+                # lower is better for losses
+                if monitored < (best_monitored - args.early_stop_min_delta):
+                    improved = True
+
+            if improved:
+                best_monitored = monitored
+                best_epoch = epoch
+                epochs_no_improve = 0
+                # save best checkpoint
+                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'best.pth'))
+                print(f'New best {args.early_stop_monitor}={best_monitored:.4f} at epoch {epoch+1}, saved best.pth')
+            else:
+                epochs_no_improve += 1
+                print(f'No improvement in {args.early_stop_monitor} for {epochs_no_improve} epochs (best: {best_monitored})')
+
+            if epochs_no_improve >= args.early_stop_patience and args.early_stop_patience > 0:
+                print(f'Early stopping: no improvement in {args.early_stop_monitor} for {epochs_no_improve} epochs (patience={args.early_stop_patience})')
+                # save final checkpoint
+                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'final_epoch_{epoch}.pth'))
+                break
 
         # scheduler step
         if lr_scheduler is not None:
