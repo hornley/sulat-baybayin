@@ -42,9 +42,9 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
         draw.text((x1 + 3, y1 + 3), f"{cname}:{score:.2f}", fill='red')
         preds.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'xc': xc, 'yc': yc, 'w': w, 'h': h, 'label': cname, 'score': float(score)})
 
-    # If no preds, return empty
+    # If no preds, return empty structures (6-tuple)
     if not preds:
-        return img, [], ''
+        return img, [], '', [], [], []
 
     # compute average sizes to set clustering thresholds
     avg_h = sum(p['h'] for p in preds) / len(preds)
@@ -157,7 +157,7 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
     flat_preds_sorted = sorted(preds, key=lambda x: (x['yc'], x['xc']))
     preds_sorted = [(p['x1'], p['label'], p['score']) for p in flat_preds_sorted]
 
-    return img, preds_sorted, best_sentence, overall_sentences, annotated_positions
+    return img, preds_sorted, best_sentence, overall_sentences, annotated_positions, flat_preds_sorted
 
 
 def main():
@@ -171,6 +171,7 @@ def main():
     parser.add_argument('--y-thresh-mult', type=float, default=0.5, help='Multiplier for y clustering threshold (relative to avg height)')
     parser.add_argument('--x-thresh-mult', type=float, default=0.6, help='Multiplier for x clustering threshold (relative to avg width)')
     parser.add_argument('--min-thresh-px', type=int, default=10, help='Minimum pixel threshold for clustering')
+    parser.add_argument('--compile-inferred', action='store_true', help='Produce a single compiled inferred text file (compiled_inferred.txt) instead of separate per-image inference txts')
     args = parser.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, classes = load_checkpoint(args.ckpt, device=device)
@@ -200,8 +201,10 @@ def main():
         g_entries = []
         write_global = lambda name, sent: g_entries.append({'image': name, 'best_sentence': sent})
 
+    compiled_entries = []
+    compiled_annotations = []
     for p in paths:
-        img_out, preds_sorted, best_sentence, overall_sentences, annotated_positions = draw_predictions(
+        img_out, preds_sorted, best_sentence, overall_sentences, annotated_positions, raw_preds = draw_predictions(
             p, model, classes, device=device, thresh=args.thresh,
             y_thresh_mult=args.y_thresh_mult, x_thresh_mult=args.x_thresh_mult, min_thresh_px=args.min_thresh_px
         )
@@ -232,6 +235,17 @@ def main():
                     fh.write(f'  Pos {pi+1}: ' + ','.join(labels) + '\n')
         # append to global predictions file / structure
         write_global(os.path.basename(p), best_sentence)
+        # optionally aggregate into a compiled inferred file content
+        if args.compile_inferred:
+            # we will append a block per image to compiled_entries
+            compiled_entries.append({'image': os.path.basename(p), 'best_sentence': best_sentence, 'permutations': overall_sentences})
+            # append raw detections for CSV
+            for det in raw_preds:
+                compiled_annotations.append({
+                    'image': os.path.basename(p),
+                    'x1': det.get('x1'), 'y1': det.get('y1'), 'x2': det.get('x2'), 'y2': det.get('y2'),
+                    'label': det.get('label'), 'score': det.get('score')
+                })
 
     # finalize json if needed
     if args.global_format == 'json':
@@ -239,6 +253,28 @@ def main():
             json.dump(g_entries, gj, ensure_ascii=False, indent=2)
     else:
         gfh.close()
+    # write compiled inferred file if requested
+    if args.compile_inferred:
+        compiled_path = os.path.join(args.out, 'compiled_inferred.txt')
+        with open(compiled_path, 'w', encoding='utf8') as cf:
+            for ent in compiled_entries:
+                cf.write(f"# {ent['image']}\n")
+                cf.write("BEST: " + ent['best_sentence'] + '\n')
+                if not args.no_permutations:
+                    cf.write('PERMUTATIONS:\n')
+                    for s in ent['permutations']:
+                        cf.write(s + '\n')
+                cf.write('\n')
+        print('wrote', compiled_path)
+        # write compiled CSV of raw detections
+        csv_path = os.path.join(args.out, 'compiled_annotations.csv')
+        with open(csv_path, 'w', encoding='utf8', newline='') as cf:
+            import csv as _csv
+            writer = _csv.writer(cf)
+            writer.writerow(['image_path', 'x1', 'y1', 'x2', 'y2', 'label', 'confidence_score'])
+            for r in compiled_annotations:
+                writer.writerow([r['image'], r['x1'], r['y1'], r['x2'], r['y2'], r['label'], f"{r['score']:.6f}"])
+        print('wrote', csv_path)
     print('wrote', global_preds_path)
 
 

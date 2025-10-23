@@ -131,6 +131,10 @@ def main():
     parser.add_argument('--lr-gamma', type=float, default=0.1)
     parser.add_argument('--val-ann', default=None, help='Optional separate annotation file for validation')
     parser.add_argument('--no-batch-eval', action='store_true', help='Disable per-batch quick eval during training')
+    # real/synthetic mixing
+    parser.add_argument('--real-data', default=None, help='Root folder for photographed/real images to mix with synthetic')
+    parser.add_argument('--real-ann', default=None, help='Annotations CSV/COCO for real images')
+    parser.add_argument('--real-weight', type=float, default=0.2, help='Fraction of samples from real data per epoch (0-1)')
     # early stopping options
     parser.add_argument('--early-stop-patience', type=int, default=0, help='Number of epochs with no improvement after which training will be stopped (0 disables)')
     parser.add_argument('--early-stop-min-delta', type=float, default=0.0, help='Minimum change in monitored metric to qualify as improvement')
@@ -147,7 +151,52 @@ def main():
     # dataloader_kwargs_from_args returns a dict with batch_size and other kwargs
     dl_kwargs_local = dict(dl_kwargs)
     batch_size = dl_kwargs_local.pop('batch_size', args.batch)
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
+
+    # If real data is provided, create a combined dataset and use a WeightedRandomSampler to mix
+    if args.real_data and args.real_ann:
+        real_ds = BBoxDataset(args.real_data, ann_file=args.real_ann, transforms=default_transforms)
+        # concat datasets via simple index mapping: synthetic indices [0..N1-1], real indices [N1..N1+N2-1]
+        from torch.utils.data import Dataset
+
+        class ConcatIndexDataset(Dataset):
+            def __init__(self, ds_list):
+                self.ds_list = ds_list
+                self.lengths = [len(d) for d in ds_list]
+                self.cum_lengths = [0]
+                for l in self.lengths:
+                    self.cum_lengths.append(self.cum_lengths[-1] + l)
+
+            def __len__(self):
+                return sum(self.lengths)
+
+            def __getitem__(self, idx):
+                # find dataset
+                for di in range(len(self.ds_list)):
+                    if idx < self.cum_lengths[di+1]:
+                        local_idx = idx - self.cum_lengths[di]
+                        return self.ds_list[di][local_idx]
+                raise IndexError
+
+        combined = ConcatIndexDataset([train_ds, real_ds])
+
+        # build sampling weights so that approx real_weight fraction comes from real_ds
+        n_synth = len(train_ds)
+        n_real = len(real_ds)
+        assert n_synth > 0 and n_real > 0, 'Both synthetic and real datasets must be non-empty'
+        w_real = float(args.real_weight)
+        w_synth = max(0.0, 1.0 - w_real)
+        # per-sample weight: synthetic samples get w_synth/n_synth, real get w_real/n_real
+        import torch as _torch
+        weights = _torch.zeros(n_synth + n_real, dtype=_torch.double)
+        if n_synth:
+            weights[:n_synth] = w_synth / n_synth
+        if n_real:
+            weights[n_synth:] = w_real / n_real
+
+        sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(combined), replacement=True)
+        train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn, **dl_kwargs_local)
+    else:
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
 
     classes = train_ds.classes
     model = get_model(len(classes) + 1)
