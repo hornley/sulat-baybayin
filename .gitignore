@@ -13,3 +13,5 @@
 .DS_Store
 /src/classification/__pycache__
 /tools/__pycache__
+/src/classification/__pycache__
+*.pyc

@@ -35,8 +35,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', required=True, help='Path to checkpoint (best.pth)')
     parser.add_argument('--input', required=True, help='Image file or folder of images')
+    parser.add_argument('--out', default='out_classification', help='Output folder for per-image predictions')
     parser.add_argument('--topk', type=int, default=3)
     parser.add_argument('--img-size', type=int, default=224)
+    parser.add_argument('--compile-inferred', action='store_true', help='Write a compiled CSV/text of all predictions')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -50,11 +52,48 @@ def main():
     else:
         paths = [args.input]
 
+    os.makedirs(args.out, exist_ok=True)
+
+    compiled_rows = []
+
     for p in paths:
         preds = predict_image(model, classes, p, device=device, topk=args.topk, img_size=args.img_size)
-        print(f'File: {p}')
-        for label, prob in preds:
-            print(f'  {label}: {prob:.4f}')
+        # write per-image predictions to a text file: label <tab> confidence
+        base = os.path.splitext(os.path.basename(p))[0]
+        out_path = os.path.join(args.out, f"{base}.txt")
+        with open(out_path, 'w', encoding='utf8') as f:
+            for label, prob in preds:
+                f.write(f"{label}\t{prob:.6f}\n")
+        print(f'Wrote predictions for {p} -> {out_path}')
+
+        if args.compile_inferred:
+            # flattened row: image_path, label1, prob1, label2, prob2, ...
+            row = [p]
+            for label, prob in preds:
+                row.append(label)
+                row.append(f"{prob:.6f}")
+            compiled_rows.append(row)
+
+    # write compiled outputs if requested
+    if args.compile_inferred and compiled_rows:
+        # write a simple TXT with top-1 label per line and a CSV with expanded top-k
+        txt_out = os.path.join(args.out, 'compiled_inferred.txt')
+        csv_out = os.path.join(args.out, 'compiled_predictions.csv')
+        with open(txt_out, 'w', encoding='utf8') as tf:
+            for r in compiled_rows:
+                # r[0]=image_path, r[1]=label1
+                tf.write(f"{r[0]}\t{r[1]}\t{r[2]}\n")
+        import csv
+        with open(csv_out, 'w', newline='', encoding='utf8') as cf:
+            w = csv.writer(cf)
+            # header
+            header = ['image_path']
+            for k in range(1, args.topk + 1):
+                header += [f'label_{k}', f'prob_{k}']
+            w.writerow(header)
+            for r in compiled_rows:
+                w.writerow(r)
+        print(f'Wrote compiled_inferred: {txt_out} and CSV: {csv_out}')
 
 
 if __name__ == '__main__':
