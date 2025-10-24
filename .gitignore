@@ -15,3 +15,4 @@
 /tools/__pycache__
 /src/classification/__pycache__
 *.pyc
+/.symbol_cache
