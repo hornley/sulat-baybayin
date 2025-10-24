@@ -415,9 +415,9 @@ def main():
                 best_monitored = monitored
                 best_epoch = epoch
                 epochs_no_improve = 0
-                # save best checkpoint
-                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'best.pth'))
-                print(f'New best {args.early_stop_monitor}={best_monitored:.4f} at epoch {epoch+1}, saved best.pth')
+                # save best-seen checkpoint (keeps best observed by the monitored metric during training)
+                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'best_seen.pth'))
+                print(f'New best {args.early_stop_monitor}={best_monitored:.4f} at epoch {epoch+1}, saved best_seen.pth')
             else:
                 epochs_no_improve += 1
                 print(f'No improvement in {args.early_stop_monitor} for {epochs_no_improve} epochs (best: {best_monitored})')
@@ -426,6 +426,9 @@ def main():
                 print(f'Early stopping: no improvement in {args.early_stop_monitor} for {epochs_no_improve} epochs (patience={args.early_stop_patience})')
                 # save final checkpoint
                 save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'final_epoch_{epoch}.pth'))
+                # also save an explicit early-stop checkpoint
+                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'early_stop.pth'))
+                print(f'Saved early-stop checkpoint to early_stop.pth')
                 break
 
         # scheduler step
@@ -435,10 +438,18 @@ def main():
             except Exception:
                 pass
 
-        # Do not overwrite best.pth unconditionally. Save `last.pth` only when requested.
+        # Save last.pth each epoch when requested (overwrite)
         if args.save_last:
             save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'last.pth'))
-            print('Saved last.pth')
+            # print to confirm
+            print(f'Saved last.pth (epoch {epoch})')
+
+    # At training end (normal completion or early stop), write final checkpoint to best.pth
+    try:
+        save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'best.pth'))
+        print('Saved final checkpoint to best.pth')
+    except Exception:
+        print('Warning: could not write final best.pth')
 
     # write mix log if collected
     try:
