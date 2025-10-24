@@ -35,7 +35,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', required=True, help='Path to checkpoint (best.pth)')
     parser.add_argument('--input', required=True, help='Image file or folder of images')
-    parser.add_argument('--out', default='out_classification', help='Output folder for per-image predictions')
+    parser.add_argument('--output', default='classifications', help='Output folder for per-image predictions')
     parser.add_argument('--topk', type=int, default=3)
     parser.add_argument('--img-size', type=int, default=224)
     parser.add_argument('--compile-inferred', action='store_true', help='Write a compiled CSV/text of all predictions')
@@ -52,7 +52,7 @@ def main():
     else:
         paths = [args.input]
 
-    os.makedirs(args.out, exist_ok=True)
+    os.makedirs(args.output, exist_ok=True)
 
     compiled_rows = []
 
@@ -60,7 +60,7 @@ def main():
         preds = predict_image(model, classes, p, device=device, topk=args.topk, img_size=args.img_size)
         # write per-image predictions to a text file: label <tab> confidence
         base = os.path.splitext(os.path.basename(p))[0]
-        out_path = os.path.join(args.out, f"{base}.txt")
+        out_path = os.path.join(args.output, f"{base}.txt")
         with open(out_path, 'w', encoding='utf8') as f:
             for label, prob in preds:
                 f.write(f"{label}\t{prob:.6f}\n")
@@ -77,8 +77,8 @@ def main():
     # write compiled outputs if requested
     if args.compile_inferred and compiled_rows:
         # write a simple TXT with top-1 label per line and a CSV with expanded top-k
-        txt_out = os.path.join(args.out, 'compiled_inferred.txt')
-        csv_out = os.path.join(args.out, 'compiled_predictions.csv')
+        txt_out = os.path.join(args.output, 'compiled_inferred.txt')
+        csv_out = os.path.join(args.output, 'compiled_predictions.csv')
         with open(txt_out, 'w', encoding='utf8') as tf:
             for r in compiled_rows:
                 # r[0]=image_path, r[1]=label1

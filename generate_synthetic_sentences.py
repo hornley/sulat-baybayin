@@ -6,6 +6,7 @@ symbols so glyphs with varying sizes / bit-depths produce consistent results.
 # copy of original generate_synthetic_sentences.py kept here for clarity and use by scripts
 import os, random, csv, argparse, hashlib
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ImageDraw
+from src.shared.config_manager import generate_yaml_template, load_yaml_config, merge_configs, wait_for_user_edit
 
 
 def _exif_transpose(img):
@@ -132,6 +133,11 @@ def _cache_path_for(img_path, cache_dir, target_height, bg_threshold_pct):
 def main(argv=None):
     p = argparse.ArgumentParser()
     
+    # === YAML CONFIG OPTIONS ===
+    p.add_argument('--args-input', default=None, help='Path to YAML config file. If not exists, will generate template and pause for user to edit')
+    p.add_argument('--no-wait', action='store_true', help='Do not pause for user to edit generated YAML template (use defaults)')
+    p.add_argument('--regen-args', action='store_true', help='Force regeneration of YAML template even if file exists')
+    
     # === OUTPUT & GENERATION OPTIONS ===
     p.add_argument('--count', type=int, default=500, help='Number of images to generate')
     p.add_argument('--out-dir', default='sentences_data_synth', help='Output directory for generated images')
@@ -202,6 +208,50 @@ def main(argv=None):
     p.add_argument('--shadow-intensity', type=float, default=0.0, help='Strength (0..1) of directional shadow overlay when lighting=shadows')
     
     args = p.parse_args(argv)
+
+    # === YAML CONFIG LOADING ===
+    if args.args_input is not None:
+        yaml_path = args.args_input
+        
+        # Check if user wants to force regenerate the template
+        if args.regen_args and os.path.exists(yaml_path):
+            print(f'Regenerating YAML template at {yaml_path} due to --regen-args flag')
+            os.remove(yaml_path)
+        
+        # If YAML file doesn't exist, generate template and optionally wait for user to edit
+        if not os.path.exists(yaml_path):
+            print(f'YAML config file not found at {yaml_path}')
+            print('Generating template with current defaults...')
+            
+            # Extract all args except the YAML-specific ones
+            yaml_args = {k: v for k, v in vars(args).items() 
+                        if k not in ('args_input', 'no_wait', 'regen_args')}
+            
+            # Generate template
+            generate_yaml_template(yaml_path, yaml_args)
+            print(f'✓ Generated template: {yaml_path}')
+            
+            # Wait for user to edit unless --no-wait is specified
+            if not args.no_wait:
+                print()
+                print('Please edit the YAML file to configure your parameters.')
+                print('Press Enter when ready to continue...')
+                wait_for_user_edit(yaml_path)
+            else:
+                print('Continuing with default values (--no-wait specified)')
+        
+        # Load YAML config and merge with CLI args (CLI takes precedence)
+        print(f'Loading YAML config from {yaml_path}...')
+        yaml_config = load_yaml_config(yaml_path)
+        
+        # Merge: YAML provides base values, CLI overrides
+        merged = merge_configs(yaml_config, vars(args))
+        
+        # Update args namespace with merged values
+        for key, value in merged.items():
+            setattr(args, key, value)
+        
+        print('✓ YAML config loaded and merged with CLI arguments')
 
     ROOT = os.path.abspath('.')
     SYMBOL_ROOT = os.path.join(ROOT, 'single_symbol_data')
@@ -682,12 +732,24 @@ def main(argv=None):
         ann_path = args.ann
 
     os.makedirs(os.path.dirname(ann_path), exist_ok=True)
-    with open(ann_path, 'w', newline='', encoding='utf8') as f:
-        w = csv.writer(f)
-        w.writerow(['image_path','x1','y1','x2','y2','label'])
-        for r in rows:
-            w.writerow(r)
-    print('Wrote annotations to', ann_path)
+    
+    # When using --append, append to existing annotations CSV instead of overwriting
+    file_exists = os.path.exists(ann_path)
+    if args.append and file_exists:
+        # Append mode: don't write header, just add new rows
+        with open(ann_path, 'a', newline='', encoding='utf8') as f:
+            w = csv.writer(f)
+            for r in rows:
+                w.writerow(r)
+        print(f'Appended {len(rows)} annotations to', ann_path)
+    else:
+        # Write mode: create new file with header
+        with open(ann_path, 'w', newline='', encoding='utf8') as f:
+            w = csv.writer(f)
+            w.writerow(['image_path','x1','y1','x2','y2','label'])
+            for r in rows:
+                w.writerow(r)
+        print('Wrote annotations to', ann_path)
 
     print('Wrote', args.count, 'synthetic images to', IMG_DIR)
 

@@ -1,0 +1,76 @@
+# Classification training with paper augmentation
+# Full paper texture, lines, and lighting augmentation enabled
+
+# Data & Output
+data: single_symbol_data  # REQUIRED: will be overridden by CLI
+out: checkpoints/classification/paper_aug
+resume: null
+resume_optimizer: false
+device: null  # Auto-detect
+
+# Training Hyperparameters
+epochs: 30
+batch: 64
+lr: 0.001
+weight_decay: 0.0001
+lr_backbone: null
+lr_head: null
+schedule: cosine
+patience: 8
+
+# DataLoader Settings
+num_workers: 4
+pin_memory: true
+prefetch_factor: 2
+
+# Mixed Precision
+amp: true
+
+# Model Settings
+img_size: 224
+freeze_backbone: false
+min_count: 5
+weights: default
+
+# Standard Augmentation (enabled)
+augment: true
+
+# Paper Augmentation (ENABLED)
+aug_paper_prob: 0.7  # 70% chance to apply paper texture
+aug_paper_type_probs: "0.5,0.3,0.2"  # white, yellow-paper, dotted
+aug_paper_texture_probs: "0.4,0.3,0.3"  # plain, grainy, crumpled
+aug_paper_strength_min: 0.2
+aug_paper_strength_max: 0.45
+aug_paper_yellow_strength_min: 0.3
+aug_paper_yellow_strength_max: 0.5
+aug_crumple_strength_min: 1.5
+aug_crumple_strength_max: 3.5
+aug_crumple_mesh_overlap: 2
+
+# Paper Lines (ENABLED)
+aug_lines_prob: 0.5  # 50% chance for ruled lines
+aug_line_spacing_min: 22
+aug_line_spacing_max: 34
+aug_line_opacity_min: 25
+aug_line_opacity_max: 65
+aug_line_thickness_min: 1
+aug_line_thickness_max: 2
+aug_line_jitter_min: 1
+aug_line_jitter_max: 4
+aug_line_color: "0,0,0"
+
+# Lighting (ENABLED)
+aug_lighting_prob: 0.6  # 60% chance for lighting variation
+aug_lighting_modes: "normal,bright,dim,shadows"
+aug_brightness_jitter: 0.04
+aug_contrast_jitter: 0.04
+aug_shadow_intensity_min: 0.1
+aug_shadow_intensity_max: 0.35
+
+# Dotted Paper
+aug_dot_size: 1
+aug_dot_opacity: 50
+aug_dot_spacing: 18
+
+# Early Stopping
+early_stop: 0  # Use patience instead

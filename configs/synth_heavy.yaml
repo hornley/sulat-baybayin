@@ -1,0 +1,71 @@
+# Heavy synthetic data generation config
+# Aggressive augmentation with all features enabled
+
+# Output & Generation
+count: 10000
+out_dir: sentences_data_synth_heavy
+ann: null  # Will save to out_dir/annotations.csv
+append: false
+min_symbols: 3
+max_symbols: 10
+
+# Symbol Normalization
+symbol_height_frac: 0.55
+bg_thresh_pct: 99.5
+crop_pad: 2
+mask_smooth_radius: 0.8
+use_cache: true
+cache_dir: .symbol_cache
+
+# Shadow & Erosion (enabled)
+erode_shadow: true
+erode_shadow_min_thickness: 2.5
+erode_shadow_prob: 0.7
+erode_glyph: true
+erode_glyph_min_thickness: 4.0
+erode_glyph_prob: 0.5
+
+# Ink Appearance
+ink_color: black
+ink_darken_min: 0.75
+ink_darken_max: 0.96
+ink_alpha_gain: 1.1
+ink_alpha_gamma: 0.95
+
+# Thin Stroke Helpers
+thin_stroke_thresh: 3.5
+thin_alpha_gain: 1.3
+thin_alpha_gamma: 0.85
+thin_darken_boost: 0.1
+thin_alpha_floor: 140
+
+# Paper Type & Texture (mixed)
+paper_type: white  # Overridden by paper_type_mix
+paper_type_mix: "0.5,0.3,0.2"  # white, yellow-paper, dotted
+paper_texture: crumpled  # Can be plain/grainy/crumpled
+paper_strength: 0.35
+paper_yellow_strength: 0.4
+
+# Ruled Lines (enabled)
+paper_lines_prob: 0.4
+line_spacing: 28
+line_opacity: 45
+line_thickness: 1
+line_jitter: 3
+line_color: "0,0,0"
+
+# Dotted Paper
+dot_size: 1
+dot_opacity: 55
+dot_spacing: 18
+dot_foreground: false
+
+# Crumpled Texture (enabled)
+crumple_strength: 2.5
+crumple_mesh_overlap: 2
+
+# Lighting (varied)
+lighting: shadows  # Will use random modes in practice
+brightness_jitter: 0.04
+contrast_jitter: 0.04
+shadow_intensity: 0.25

@@ -8,6 +8,7 @@ from src.classification.dataset import make_dataloaders
 from src.classification.model import BaybayinClassifier
 from src.shared.utils import save_checkpoint
 from src.shared.train_args import add_common_training_args, dataloader_kwargs_from_args
+from src.shared.config_manager import generate_yaml_template, load_yaml_config, merge_configs, wait_for_user_edit
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
@@ -59,6 +60,12 @@ def evaluate(model, loader, criterion, device):
 
 def main():
     parser = argparse.ArgumentParser()
+    
+    # === YAML CONFIG OPTIONS ===
+    parser.add_argument('--args-input', default=None, help='Path to YAML config file. If not exists, will generate template and pause for user to edit')
+    parser.add_argument('--no-wait', action='store_true', help='Do not pause for user to edit generated YAML template (use defaults)')
+    parser.add_argument('--regen-args', action='store_true', help='Force regeneration of YAML template even if file exists')
+    
     parser.add_argument('--data', required=True, help='Root folder with class subfolders')
     # common args
     add_common_training_args(parser)
@@ -69,18 +76,167 @@ def main():
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (by val_loss); set 0 to disable')
     # backward-compatible alias used previously by some scripts
     parser.add_argument('--img-size', type=int, default=224)
-    parser.add_argument('--augment', action='store_true', help='Enable training data augmentation')
+    parser.add_argument('--augment', action='store_true', help='Enable standard geometric/color augmentations')
     parser.add_argument('--freeze-backbone', action='store_true', help='Freeze backbone layers and train only the classifier')
     parser.add_argument('--min-count', type=int, default=5, help='Minimum number of images required for a class to be included')
     parser.add_argument('--weights', type=str, default='default', help="Which pretrained weights to use: 'default', 'v1', or 'none'")
+    
+    # === PAPER TEXTURE AUGMENTATION ===
+    parser.add_argument('--aug-paper-prob', type=float, default=0.0, help='Probability to apply paper texture augmentation (0..1)')
+    parser.add_argument('--aug-paper-type-probs', type=str, default='0.6,0.2,0.2', help='Probabilities for [white, yellow-paper, dotted] as comma-separated (should sum to 1.0)')
+    parser.add_argument('--aug-paper-texture-probs', type=str, default='0.5,0.3,0.2', help='Probabilities for [plain, grainy, crumpled] as comma-separated (should sum to 1.0)')
+    parser.add_argument('--aug-paper-strength-min', type=float, default=0.2, help='Minimum paper blend strength (0..1)')
+    parser.add_argument('--aug-paper-strength-max', type=float, default=0.4, help='Maximum paper blend strength (0..1)')
+    parser.add_argument('--aug-paper-yellow-strength-min', type=float, default=0.3, help='Minimum yellow-paper strength (0..1)')
+    parser.add_argument('--aug-paper-yellow-strength-max', type=float, default=0.5, help='Maximum yellow-paper strength (0..1)')
+    parser.add_argument('--aug-crumple-strength-min', type=float, default=1.0, help='Minimum crumple warp strength')
+    parser.add_argument('--aug-crumple-strength-max', type=float, default=3.0, help='Maximum crumple warp strength')
+    parser.add_argument('--aug-crumple-mesh-overlap', type=int, default=2, help='Pixel overlap for crumple mesh tiles')
+    
+    # === PAPER LINES AUGMENTATION ===
+    parser.add_argument('--aug-lines-prob', type=float, default=0.0, help='Probability to overlay ruled paper lines (0..1)')
+    parser.add_argument('--aug-line-spacing-min', type=int, default=24, help='Minimum pixel spacing between lines')
+    parser.add_argument('--aug-line-spacing-max', type=int, default=32, help='Maximum pixel spacing between lines')
+    parser.add_argument('--aug-line-opacity-min', type=int, default=30, help='Minimum line opacity (0-255)')
+    parser.add_argument('--aug-line-opacity-max', type=int, default=60, help='Maximum line opacity (0-255)')
+    parser.add_argument('--aug-line-thickness-min', type=int, default=1, help='Minimum line thickness in pixels')
+    parser.add_argument('--aug-line-thickness-max', type=int, default=2, help='Maximum line thickness in pixels')
+    parser.add_argument('--aug-line-jitter-min', type=int, default=1, help='Minimum vertical jitter per line')
+    parser.add_argument('--aug-line-jitter-max', type=int, default=3, help='Maximum vertical jitter per line')
+    parser.add_argument('--aug-line-color', type=str, default='0,0,0', help='RGB color for lines as comma-separated ints')
+    
+    # === LIGHTING AUGMENTATION ===
+    parser.add_argument('--aug-lighting-prob', type=float, default=0.0, help='Probability to apply lighting variations (0..1)')
+    parser.add_argument('--aug-lighting-modes', type=str, default='normal,bright,dim,shadows', help='Comma-separated lighting modes to sample from')
+    parser.add_argument('--aug-brightness-jitter', type=float, default=0.03, help='Brightness jitter amount for normal lighting mode')
+    parser.add_argument('--aug-contrast-jitter', type=float, default=0.03, help='Contrast jitter amount for normal lighting mode')
+    parser.add_argument('--aug-shadow-intensity-min', type=float, default=0.0, help='Minimum shadow intensity for shadows mode (0..1)')
+    parser.add_argument('--aug-shadow-intensity-max', type=float, default=0.3, help='Maximum shadow intensity for shadows mode (0..1)')
+    
+    # === DOTTED PAPER OPTIONS ===
+    parser.add_argument('--aug-dot-size', type=int, default=1, help='Radius for dotted paper dots')
+    parser.add_argument('--aug-dot-opacity', type=int, default=50, help='Opacity for dotted paper dots (0-255)')
+    parser.add_argument('--aug-dot-spacing', type=int, default=18, help='Spacing in pixels between dots')
+    
     args = parser.parse_args()
+
+    # === YAML CONFIG LOADING ===
+    if args.args_input is not None:
+        yaml_path = args.args_input
+        
+        # Check if user wants to force regenerate the template
+        if args.regen_args and os.path.exists(yaml_path):
+            print(f'Regenerating YAML template at {yaml_path} due to --regen-args flag')
+            os.remove(yaml_path)
+        
+        # If YAML file doesn't exist, generate template and optionally wait for user to edit
+        if not os.path.exists(yaml_path):
+            print(f'YAML config file not found at {yaml_path}')
+            print('Generating template with current defaults...')
+            
+            # Extract all args except the YAML-specific ones
+            yaml_args = {k: v for k, v in vars(args).items() 
+                        if k not in ('args_input', 'no_wait', 'regen_args')}
+            
+            # Generate template
+            generate_yaml_template(yaml_path, yaml_args)
+            print(f'✓ Generated template: {yaml_path}')
+            
+            # Wait for user to edit unless --no-wait is specified
+            if not args.no_wait:
+                print()
+                print('Please edit the YAML file to configure your parameters.')
+                print('Press Enter when ready to continue...')
+                wait_for_user_edit(yaml_path)
+            else:
+                print('Continuing with default values (--no-wait specified)')
+        
+        # Load YAML config and merge with CLI args (CLI takes precedence)
+        print(f'Loading YAML config from {yaml_path}...')
+        yaml_config = load_yaml_config(yaml_path)
+        
+        # Merge: YAML provides base values, CLI overrides
+        merged = merge_configs(yaml_config, vars(args))
+        
+        # Update args namespace with merged values
+        for key, value in merged.items():
+            setattr(args, key, value)
+        
+        print('✓ YAML config loaded and merged with CLI arguments')
 
     # device selection
     device = args.device if args.device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # build paper augmentation if any paper aug flags are enabled
+    paper_aug = None
+    if args.aug_paper_prob > 0 or args.aug_lines_prob > 0 or args.aug_lighting_prob > 0:
+        from src.classification.dataset import PaperAugmentation
+        
+        # parse probability lists
+        def parse_probs(s):
+            return [float(x.strip()) for x in s.split(',')]
+        
+        # parse color
+        def parse_color(s):
+            parts = [int(x.strip()) for x in s.split(',')]
+            return tuple(parts)
+        
+        paper_type_probs = parse_probs(args.aug_paper_type_probs)
+        paper_texture_probs = parse_probs(args.aug_paper_texture_probs)
+        lighting_modes = [m.strip() for m in args.aug_lighting_modes.split(',')]
+        line_color = parse_color(args.aug_line_color)
+        
+        paper_aug = PaperAugmentation(
+            # paper texture
+            paper_prob=args.aug_paper_prob,
+            paper_type_probs=paper_type_probs,
+            paper_texture_probs=paper_texture_probs,
+            paper_strength_min=args.aug_paper_strength_min,
+            paper_strength_max=args.aug_paper_strength_max,
+            paper_yellow_strength_min=args.aug_paper_yellow_strength_min,
+            paper_yellow_strength_max=args.aug_paper_yellow_strength_max,
+            crumple_strength_min=args.aug_crumple_strength_min,
+            crumple_strength_max=args.aug_crumple_strength_max,
+            crumple_mesh_overlap=args.aug_crumple_mesh_overlap,
+            # paper lines
+            lines_prob=args.aug_lines_prob,
+            line_spacing_min=args.aug_line_spacing_min,
+            line_spacing_max=args.aug_line_spacing_max,
+            line_opacity_min=args.aug_line_opacity_min,
+            line_opacity_max=args.aug_line_opacity_max,
+            line_thickness_min=args.aug_line_thickness_min,
+            line_thickness_max=args.aug_line_thickness_max,
+            line_jitter_min=args.aug_line_jitter_min,
+            line_jitter_max=args.aug_line_jitter_max,
+            line_color=line_color,
+            # lighting
+            lighting_prob=args.aug_lighting_prob,
+            lighting_modes=lighting_modes,
+            brightness_jitter=args.aug_brightness_jitter,
+            contrast_jitter=args.aug_contrast_jitter,
+            shadow_intensity_min=args.aug_shadow_intensity_min,
+            shadow_intensity_max=args.aug_shadow_intensity_max,
+            # dotted paper
+            dot_size=args.aug_dot_size,
+            dot_opacity=args.aug_dot_opacity,
+            dot_spacing=args.aug_dot_spacing,
+        )
+        
+        print(f"Paper augmentation enabled:")
+        print(f"  - Paper texture prob: {args.aug_paper_prob}")
+        print(f"  - Lines prob: {args.aug_lines_prob}")
+        print(f"  - Lighting prob: {args.aug_lighting_prob}")
+
     # build dataloaders with DataLoader kwargs from common args
     dl_kwargs = dataloader_kwargs_from_args(args)
-    train_loader, val_loader, classes = make_dataloaders(args.data, batch_size=dl_kwargs.get('batch_size', args.batch), img_size=args.img_size, augment=args.augment, min_count=args.min_count,)
+    train_loader, val_loader, classes = make_dataloaders(
+        args.data, 
+        batch_size=dl_kwargs.get('batch_size', args.batch), 
+        img_size=args.img_size, 
+        augment=args.augment, 
+        min_count=args.min_count,
+        paper_aug=paper_aug
+    )
 
     # map weights option to torchvision enum when available
     weights_arg = None

@@ -1,0 +1,76 @@
+# Baseline classification training config
+# Standard training without paper augmentation
+
+# Data & Output
+data: single_symbol_data  # REQUIRED: will be overridden by CLI
+out: checkpoints/classification/baseline
+resume: null
+resume_optimizer: false
+device: null  # Auto-detect
+
+# Training Hyperparameters
+epochs: 20
+batch: 64
+lr: 0.001
+weight_decay: 0.0001
+lr_backbone: null
+lr_head: null
+schedule: cosine
+patience: 5
+
+# DataLoader Settings
+num_workers: 4
+pin_memory: true
+prefetch_factor: 2
+
+# Mixed Precision
+amp: true
+
+# Model Settings
+img_size: 224
+freeze_backbone: false
+min_count: 5
+weights: default  # Can be: default, v1, none
+
+# Standard Augmentation (enabled)
+augment: true
+
+# Paper Augmentation (DISABLED for baseline)
+aug_paper_prob: 0.0
+aug_paper_type_probs: "0.6,0.2,0.2"
+aug_paper_texture_probs: "0.5,0.3,0.2"
+aug_paper_strength_min: 0.2
+aug_paper_strength_max: 0.4
+aug_paper_yellow_strength_min: 0.3
+aug_paper_yellow_strength_max: 0.5
+aug_crumple_strength_min: 1.0
+aug_crumple_strength_max: 3.0
+aug_crumple_mesh_overlap: 2
+
+# Paper Lines (DISABLED for baseline)
+aug_lines_prob: 0.0
+aug_line_spacing_min: 24
+aug_line_spacing_max: 32
+aug_line_opacity_min: 30
+aug_line_opacity_max: 60
+aug_line_thickness_min: 1
+aug_line_thickness_max: 2
+aug_line_jitter_min: 1
+aug_line_jitter_max: 3
+aug_line_color: "0,0,0"
+
+# Lighting (DISABLED for baseline)
+aug_lighting_prob: 0.0
+aug_lighting_modes: "normal,bright,dim,shadows"
+aug_brightness_jitter: 0.03
+aug_contrast_jitter: 0.03
+aug_shadow_intensity_min: 0.0
+aug_shadow_intensity_max: 0.3
+
+# Dotted Paper
+aug_dot_size: 1
+aug_dot_opacity: 50
+aug_dot_spacing: 18
+
+# Early Stopping (using patience instead)
+early_stop: 0

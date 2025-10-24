@@ -16,3 +16,7 @@
 /src/classification/__pycache__
 *.pyc
 /.symbol_cache
+/classifications
+/single_symbol_testing_lined
+/src/classification/__pycache__
+/sentences_data_synth_run11

@@ -1,0 +1,71 @@
+# Light synthetic data generation config
+# Minimal augmentation for baseline datasets
+
+# Output & Generation
+count: 1000
+out_dir: sentences_data_synth_light
+ann: null  # Will save to out_dir/annotations.csv
+append: false
+min_symbols: 3
+max_symbols: 8
+
+# Symbol Normalization
+symbol_height_frac: 0.55
+bg_thresh_pct: 99.5
+crop_pad: 2
+mask_smooth_radius: 0.8
+use_cache: true
+cache_dir: .symbol_cache
+
+# Shadow & Erosion (disabled for light)
+erode_shadow: false
+erode_shadow_min_thickness: 2.5
+erode_shadow_prob: 1.0
+erode_glyph: false
+erode_glyph_min_thickness: 4.0
+erode_glyph_prob: 1.0
+
+# Ink Appearance
+ink_color: black
+ink_darken_min: 0.85
+ink_darken_max: 0.95
+ink_alpha_gain: 1.0
+ink_alpha_gamma: 1.0
+
+# Thin Stroke Helpers
+thin_stroke_thresh: 3.5
+thin_alpha_gain: 1.15
+thin_alpha_gamma: 0.9
+thin_darken_boost: 0.05
+thin_alpha_floor: 100
+
+# Paper Type & Texture (plain white only)
+paper_type: white
+paper_type_mix: null  # Use single paper type
+paper_texture: plain
+paper_strength: 0.2
+paper_yellow_strength: null
+
+# Ruled Lines (disabled)
+paper_lines_prob: 0.0
+line_spacing: 28
+line_opacity: 40
+line_thickness: 1
+line_jitter: 2
+line_color: "0,0,0"
+
+# Dotted Paper (not used)
+dot_size: 1
+dot_opacity: 50
+dot_spacing: 18
+dot_foreground: false
+
+# Crumpled Texture (disabled)
+crumple_strength: 0
+crumple_mesh_overlap: 2
+
+# Lighting (normal only)
+lighting: normal
+brightness_jitter: 0.02
+contrast_jitter: 0.02
+shadow_intensity: 0.0

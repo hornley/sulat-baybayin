@@ -1,0 +1,57 @@
+# Detection training Stage 2
+# Full model training with lower learning rates
+
+# Data & Output
+data: sentences_data_synth
+ann: annotations/synthetic_annotations.csv
+out: checkpoints/detection/baseline/stage2
+resume: checkpoints/detection/baseline/stage1/best.pth  # Resume from stage 1
+resume_optimizer: true  # Continue optimizer state
+device: null
+
+# Training Hyperparameters
+epochs: 30
+batch: 4
+lr: 0.0001
+weight_decay: 0.001
+momentum: 0.9
+lr_backbone: 0.00002  # Low LR for backbone
+lr_head: 0.00005  # Low LR for head
+
+# DataLoader Settings
+num_workers: 4
+pin_memory: true
+prefetch_factor: null
+
+# Mixed Precision
+amp: true
+
+# Detection-Specific
+freeze_backbone: false  # Unfreeze all layers
+save_last: true
+no_batch_eval: true
+
+# Learning Rate Schedule
+schedule: step
+lr_step: 5
+lr_gamma: 0.1
+
+# Validation
+val_ann: null
+
+# Real/Synthetic Mixing
+real_data: null
+real_ann: null
+real_weight: 0.2
+mix_strategy: quotas
+
+# Early Stopping
+early_stop_patience: 8
+early_stop_min_delta: 0.0002
+early_stop_monitor: train_loss
+
+# Google Drive Backup
+gdrive_backup: null
+
+# Early Stop (legacy)
+early_stop: 0

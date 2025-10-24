@@ -1,0 +1,76 @@
+# Configuration File
+# Generated automatically - edit as needed
+# 
+# CLI arguments override values in this file
+# Use --no-wait to skip confirmation prompt
+# Use --regen-args to regenerate this file from CLI args
+
+# === OUTPUT & GENERATION ===
+count: 5000
+out_dir: sentences_data_synth
+ann: null
+append: false
+min_symbols: 3
+max_symbols: 8
+
+# === SYMBOL NORMALIZATION ===
+symbol_height_frac: 0.55
+bg_thresh_pct: 99.5
+crop_pad: 2
+mask_smooth_radius: 0.8
+use_cache: false
+cache_dir: .symbol_cache
+
+# === SHADOW & EROSION ===
+erode_shadow: false
+erode_shadow_min_thickness: 2.5
+erode_shadow_prob: 1.0
+erode_glyph: false
+erode_glyph_min_thickness: 4.0
+erode_glyph_prob: 1.0
+
+# === INK APPEARANCE ===
+ink_color: black
+ink_darken_min: 0.82
+ink_darken_max: 0.96
+ink_alpha_gain: 1.0
+ink_alpha_gamma: 1.0
+
+# === THIN STROKE HELPERS ===
+thin_stroke_thresh: 3.5
+thin_alpha_gain: 1.25
+thin_alpha_gamma: 0.85
+thin_darken_boost: 0.08
+thin_alpha_floor: 130
+
+# === PAPER TYPE & TEXTURE ===
+paper_type: white
+paper_type_mix: null
+paper_texture: plain
+paper_strength: null
+paper_yellow_strength: null
+
+# === RULED LINES ===
+paper_lines_prob: 0.0
+line_spacing: 28
+line_opacity: 40
+line_thickness: 1
+line_jitter: 2
+line_color: "0,0,0"
+
+# === DOTTED PAPER ===
+dot_size: 1
+dot_opacity: 50
+dot_spacing: 18
+dot_foreground: false
+
+# === CRUMPLED TEXTURE ===
+crumple_strength: 3
+crumple_mesh_overlap: 2
+
+# === LIGHTING ===
+lighting: normal
+brightness_jitter: 0.03
+contrast_jitter: 0.03
+shadow_intensity: 0.0
+

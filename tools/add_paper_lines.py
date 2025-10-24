@@ -79,8 +79,8 @@ Examples:
     )
     
     # === INPUT/OUTPUT ===
-    parser.add_argument('--input', '-i', required=True, help='Input image file or directory containing images')
-    parser.add_argument('--output', '-o', required=True, help='Output image file or directory for processed images')
+    parser.add_argument('--input', required=True, help='Input image file or directory containing images')
+    parser.add_argument('--output', required=True, help='Output image file or directory for processed images')
     
     # === PAPER LINE STYLING ===
     parser.add_argument('--line-spacing', type=int, default=28, help='Pixel spacing between ruled lines (default: 28)')
