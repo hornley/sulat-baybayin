@@ -130,6 +130,30 @@ def _cache_path_for(img_path, cache_dir, target_height, bg_threshold_pct):
     return os.path.join(cache_dir, f"{base}_{h}.png")
 
 
+def _generate_random_ink_color():
+    """Generate a random ink color suitable for writing.
+    Returns RGB tuple with darker, more realistic colors.
+    """
+    # Predefined palette of realistic ink colors
+    ink_palette = [
+        (0, 0, 0),          # Black
+        (20, 20, 20),       # Near black
+        (40, 40, 100),      # Dark blue
+        (50, 50, 150),      # Blue
+        (60, 40, 120),      # Purple-blue
+        (100, 60, 30),      # Brown
+        (90, 50, 20),       # Dark brown
+        (120, 30, 30),      # Dark red
+        (100, 30, 50),      # Burgundy
+        (50, 60, 50),       # Dark green
+        (60, 60, 60),       # Dark gray
+        (80, 70, 50),       # Sepia
+        (30, 30, 80),       # Navy blue
+        (70, 40, 40),       # Brown-red
+    ]
+    return random.choice(ink_palette)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     
@@ -163,7 +187,10 @@ def main(argv=None):
     p.add_argument('--erode-glyph-prob', type=float, default=1.0, help='Probability (0..1) to apply glyph erosion when allowed')
     
     # === INK APPEARANCE ===
-    p.add_argument('--ink-color', choices=['original','grayscale','black'], default='black', help='Force ink colorization: original colors, grayscale, or pure black')
+    p.add_argument('--ink-color', type=str, default='black', help='Ink color: "original" (keep source colors), "grayscale", "black", "random" (random colors), or custom RGB as "R,G,B" (e.g. "50,50,150" for dark blue)')
+    p.add_argument('--ink-color-variation', type=int, default=0, help='Random RGB variation per symbol (0-50). Each RGB channel varies by ±this amount. 0 disables variation.')
+    p.add_argument('--ink-random-mode', type=str, choices=['per-symbol', 'per-image'], default='per-image', help='When --ink-color="random": "per-symbol" (each symbol different color) or "per-image" (all symbols in image same random color)')
+    p.add_argument('--ink-random-prob', type=float, default=0.2, help='Probability (0.0-1.0) of applying random ink color when --ink-color="random". Allows mixing with fallback (black). Default: 0.2 (20%% of images/symbols get random color)')
     p.add_argument('--ink-darken-min', type=float, default=0.82, help='Minimum brightness factor for ink darkening (0..1, lower is darker)')
     p.add_argument('--ink-darken-max', type=float, default=0.96, help='Maximum brightness factor for ink darkening (<=1, lower is darker)')
     p.add_argument('--ink-alpha-gain', type=float, default=1.0, help='Multiply glyph alpha by this gain before paste (>=1.0 increases opacity)')
@@ -346,6 +373,26 @@ def main(argv=None):
             current_paper_type = random.choices(paper_type_choices, weights=paper_type_probs)[0]
         else:
             current_paper_type = args.paper_type
+
+        # Generate random ink color per-image if ink-color is "random" and mode is "per-image"
+        per_image_random_color = None
+        per_image_use_random = False
+        try:
+            if str(args.ink_color).strip().lower() == 'random':
+                random_mode = str(args.ink_random_mode).strip().lower()
+                if random_mode == 'per-image':
+                    # Check probability to decide if this image gets random color
+                    try:
+                        prob = float(args.ink_random_prob)
+                    except Exception:
+                        prob = 0.2
+                    
+                    if random.random() < prob:
+                        per_image_use_random = True
+                        per_image_random_color = _generate_random_ink_color()
+        except Exception:
+            per_image_random_color = None
+            per_image_use_random = False
 
         symbols = random.randint(args.min_symbols, args.max_symbols)
         x = 8
@@ -530,9 +577,10 @@ def main(argv=None):
                     rgb = ImageEnhance.Brightness(rgb).enhance(factor)
                     # optionally neutralize/force ink color
                     try:
-                        mode = str(args.ink_color)
+                        mode = str(args.ink_color).strip().lower()
                     except Exception:
                         mode = 'original'
+                    
                     if mode == 'grayscale':
                         try:
                             gray = rgb.convert('L')
@@ -541,7 +589,86 @@ def main(argv=None):
                             pass
                     elif mode == 'black':
                         # set ink RGB to black; alpha carries stroke shape and edges
-                        rgb = Image.new('RGB', rgb.size, (0,0,0))
+                        rgb = Image.new('RGB', rgb.size, (0, 0, 0))
+                    elif mode == 'random':
+                        # Use random ink color - either per-image or per-symbol
+                        try:
+                            random_mode = str(args.ink_random_mode).strip().lower()
+                        except Exception:
+                            random_mode = 'per-image'
+                        
+                        # Check probability for whether to apply random color
+                        try:
+                            prob = float(args.ink_random_prob)
+                        except Exception:
+                            prob = 0.2
+                        
+                        should_use_random = False
+                        
+                        if random_mode == 'per-image':
+                            # For per-image mode, use the flag set at image level
+                            if per_image_use_random and per_image_random_color is not None:
+                                base_r, base_g, base_b = per_image_random_color
+                                should_use_random = True
+                        else:
+                            # For per-symbol mode, check probability for each symbol
+                            if random.random() < prob:
+                                base_r, base_g, base_b = _generate_random_ink_color()
+                                should_use_random = True
+                        
+                        if should_use_random:
+                            # Apply per-symbol variation if specified
+                            try:
+                                variation = int(args.ink_color_variation)
+                            except Exception:
+                                variation = 0
+                            
+                            if variation > 0:
+                                r = max(0, min(255, base_r + random.randint(-variation, variation)))
+                                g = max(0, min(255, base_g + random.randint(-variation, variation)))
+                                b = max(0, min(255, base_b + random.randint(-variation, variation)))
+                            else:
+                                r, g, b = base_r, base_g, base_b
+                            
+                            # Set ink to random color
+                            rgb = Image.new('RGB', rgb.size, (r, g, b))
+                        else:
+                            # Fallback to black when probability doesn't trigger
+                            rgb = Image.new('RGB', rgb.size, (0, 0, 0))
+                    elif mode != 'original':
+                        # try to parse as custom RGB value (e.g. "50,50,150")
+                        try:
+                            parts = [x.strip() for x in mode.split(',')]
+                            if len(parts) == 3:
+                                base_r = int(parts[0])
+                                base_g = int(parts[1])
+                                base_b = int(parts[2])
+                                
+                                # apply per-symbol color variation if specified
+                                try:
+                                    variation = int(args.ink_color_variation)
+                                except Exception:
+                                    variation = 0
+                                
+                                if variation > 0:
+                                    # add random variation to each channel (±variation)
+                                    r = max(0, min(255, base_r + random.randint(-variation, variation)))
+                                    g = max(0, min(255, base_g + random.randint(-variation, variation)))
+                                    b = max(0, min(255, base_b + random.randint(-variation, variation)))
+                                else:
+                                    r, g, b = base_r, base_g, base_b
+                                
+                                # clamp to valid range
+                                r = max(0, min(255, r))
+                                g = max(0, min(255, g))
+                                b = max(0, min(255, b))
+                                
+                                # set ink to custom color
+                                rgb = Image.new('RGB', rgb.size, (r, g, b))
+                        except Exception:
+                            # if parsing fails, default to black
+                            rgb = Image.new('RGB', rgb.size, (0, 0, 0))
+                    
                     glyph = rgb.convert('RGBA')
 
                     # determine which mask to use for glyph paste (may erode if user allows),

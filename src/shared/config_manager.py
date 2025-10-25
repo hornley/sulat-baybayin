@@ -71,7 +71,12 @@ def generate_yaml_template(output_path: str, config_dict: Dict[str, Any], header
             ('DETECTION SPECIFIC', ['freeze_backbone', 'save_last', 'no_batch_eval']),
             ('LEARNING RATE SCHEDULE', ['schedule', 'lr_step', 'lr_gamma']),
             ('VALIDATION', ['val_ann']),
-            ('REAL/SYNTHETIC MIXING', ['real_data', 'real_ann', 'real_weight', 'mix_strategy']),
+            ('REAL/SYNTHETIC MIXING', ['real_data', 'real_ann', 'real_weight', 'mix_strategy', 'real_samples_fixed']),
+            ('AUGMENTATION - ENABLE FLAGS', ['aug_enable', 'aug_photometric', 'aug_lighting', 'aug_geometric']),
+            ('AUGMENTATION - PHOTOMETRIC', ['aug_brightness_min', 'aug_brightness_max', 'aug_contrast_min', 'aug_contrast_max', 'aug_gamma_min', 'aug_gamma_max', 'aug_blur_min', 'aug_blur_max', 'aug_noise_min', 'aug_noise_max']),
+            ('AUGMENTATION - LIGHTING', ['aug_shadow_prob', 'aug_shadow_intensity_min', 'aug_shadow_intensity_max', 'aug_overhead_prob', 'aug_overhead_intensity_min', 'aug_overhead_intensity_max', 'aug_spotlight_prob', 'aug_spotlight_radius_min', 'aug_spotlight_radius_max', 'aug_vignette_prob', 'aug_vignette_intensity_min', 'aug_vignette_intensity_max', 'aug_ambient_min', 'aug_ambient_max']),
+            ('AUGMENTATION - GEOMETRIC', ['aug_rotation_min', 'aug_rotation_max', 'aug_hflip_prob', 'aug_scale_min', 'aug_scale_max', 'aug_translate_min', 'aug_translate_max', 'aug_shear_min', 'aug_shear_max']),
+            ('AUGMENTATION - PROBABILITIES', ['aug_photometric_prob', 'aug_lighting_prob', 'aug_geometric_prob']),
             ('EARLY STOPPING', ['early_stop_patience', 'early_stop_min_delta', 'early_stop_monitor', 'early_stop']),
             ('GOOGLE DRIVE BACKUP', ['gdrive_backup']),
         ]

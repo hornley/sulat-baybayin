@@ -9,6 +9,7 @@ import random
 import sys
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from src.detection.dataset import BBoxDataset
+from src.detection.augmentations import create_augmentation_from_args
 from src.shared.train_args import add_common_training_args, dataloader_kwargs_from_args
 from src.shared.utils import save_checkpoint
 from src.shared.config_manager import generate_yaml_template, load_yaml_config, merge_configs, wait_for_user_edit
@@ -212,6 +213,60 @@ def main():
     parser.add_argument('--early-stop-monitor', choices=['val_loss', 'train_loss', 'acc'], default='val_loss', help='Metric to monitor for early stopping')
     # google drive backup option
     parser.add_argument('--gdrive-backup', default=None, help='Google Drive path to backup checkpoints (e.g., /content/drive/MyDrive/SulatBaybayin/)')
+    
+    # === AUGMENTATION OPTIONS ===
+    parser.add_argument('--aug-enable', action='store_true', help='Enable augmentation during training')
+    parser.add_argument('--aug-photometric', action='store_true', default=True, help='Enable photometric augmentations (brightness, contrast, gamma, blur, noise)')
+    parser.add_argument('--aug-lighting', action='store_true', default=True, help='Enable lighting effects (shadows, overhead, spotlight, vignette, ambient)')
+    parser.add_argument('--aug-geometric', action='store_true', default=True, help='Enable geometric transformations (rotation, flip, scale, translate, shear)')
+    
+    # Photometric parameters
+    parser.add_argument('--aug-brightness-min', type=float, default=0.7, help='Minimum brightness multiplier')
+    parser.add_argument('--aug-brightness-max', type=float, default=1.3, help='Maximum brightness multiplier')
+    parser.add_argument('--aug-contrast-min', type=float, default=0.8, help='Minimum contrast multiplier')
+    parser.add_argument('--aug-contrast-max', type=float, default=1.2, help='Maximum contrast multiplier')
+    parser.add_argument('--aug-gamma-min', type=float, default=0.8, help='Minimum gamma value')
+    parser.add_argument('--aug-gamma-max', type=float, default=1.2, help='Maximum gamma value')
+    parser.add_argument('--aug-blur-min', type=int, default=0, help='Minimum blur kernel size (0 = no blur)')
+    parser.add_argument('--aug-blur-max', type=int, default=3, help='Maximum blur kernel size')
+    parser.add_argument('--aug-noise-min', type=float, default=0, help='Minimum Gaussian noise std')
+    parser.add_argument('--aug-noise-max', type=float, default=5, help='Maximum Gaussian noise std')
+    
+    # Lighting parameters
+    parser.add_argument('--aug-shadow-prob', type=float, default=0.3, help='Probability of shadow casting')
+    parser.add_argument('--aug-shadow-intensity-min', type=float, default=0.3, help='Minimum shadow intensity')
+    parser.add_argument('--aug-shadow-intensity-max', type=float, default=0.7, help='Maximum shadow intensity')
+    parser.add_argument('--aug-shadow-size-small-prob', type=float, default=0.4, help='Probability of small shadow (15-35%% coverage)')
+    parser.add_argument('--aug-shadow-size-medium-prob', type=float, default=0.4, help='Probability of medium shadow (35-60%% coverage)')
+    parser.add_argument('--aug-shadow-size-large-prob', type=float, default=0.2, help='Probability of large shadow (60-85%% coverage)')
+    parser.add_argument('--aug-overhead-prob', type=float, default=0.2, help='Probability of overhead directional lighting')
+    parser.add_argument('--aug-overhead-intensity-min', type=float, default=0.1, help='Minimum overhead lighting intensity')
+    parser.add_argument('--aug-overhead-intensity-max', type=float, default=0.3, help='Maximum overhead lighting intensity')
+    parser.add_argument('--aug-spotlight-prob', type=float, default=0.15, help='Probability of spotlight effect')
+    parser.add_argument('--aug-spotlight-radius-min', type=float, default=0.3, help='Minimum spotlight radius factor')
+    parser.add_argument('--aug-spotlight-radius-max', type=float, default=0.6, help='Maximum spotlight radius factor')
+    parser.add_argument('--aug-vignette-prob', type=float, default=0.25, help='Probability of vignette effect')
+    parser.add_argument('--aug-vignette-intensity-min', type=float, default=0.2, help='Minimum vignette intensity')
+    parser.add_argument('--aug-vignette-intensity-max', type=float, default=0.5, help='Maximum vignette intensity')
+    parser.add_argument('--aug-ambient-min', type=float, default=0, help='Minimum ambient color shift')
+    parser.add_argument('--aug-ambient-max', type=float, default=15, help='Maximum ambient color shift')
+    
+    # Geometric parameters
+    parser.add_argument('--aug-rotation-min', type=float, default=-5, help='Minimum rotation angle (degrees, reduced to ±5 to keep symbols visible)')
+    parser.add_argument('--aug-rotation-max', type=float, default=5, help='Maximum rotation angle (degrees, reduced to ±5 to keep symbols visible)')
+    # Note: Horizontal flip removed - Baybayin symbols cannot be flipped horizontally
+    parser.add_argument('--aug-scale-min', type=float, default=0.9, help='Minimum scale factor')
+    parser.add_argument('--aug-scale-max', type=float, default=1.1, help='Maximum scale factor')
+    parser.add_argument('--aug-translate-min', type=float, default=-0.05, help='Minimum translation (fraction of image size)')
+    parser.add_argument('--aug-translate-max', type=float, default=0.05, help='Maximum translation (fraction of image size)')
+    parser.add_argument('--aug-shear-min', type=float, default=-5, help='Minimum shear angle (degrees)')
+    parser.add_argument('--aug-shear-max', type=float, default=5, help='Maximum shear angle (degrees)')
+    
+    # Probability controls
+    parser.add_argument('--aug-photometric-prob', type=float, default=0.8, help='Probability of applying photometric augmentations')
+    parser.add_argument('--aug-lighting-prob', type=float, default=0.6, help='Probability of applying lighting effects')
+    parser.add_argument('--aug-geometric-prob', type=float, default=0.7, help='Probability of applying geometric transformations')
+    
     args = parser.parse_args()
 
     # === YAML CONFIG LOADING ===
@@ -265,17 +320,25 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dl_kwargs = dataloader_kwargs_from_args(args)
 
+    # Create augmentation pipeline if enabled
+    augmentation = create_augmentation_from_args(args)
+    if augmentation is not None:
+        print('✓ Augmentation enabled with:')
+        print(f'  - Photometric: {args.aug_photometric}')
+        print(f'  - Lighting: {args.aug_lighting}')
+        print(f'  - Geometric: {args.aug_geometric}')
+    
     # build dataset and dataloader (root, ann_file=...)
     # ensure dataset yields torch tensors (ToTensor) so .to(device) works
     default_transforms = T.ToTensor()
-    train_ds = BBoxDataset(args.data, ann_file=args.ann, transforms=default_transforms)
+    train_ds = BBoxDataset(args.data, ann_file=args.ann, transforms=default_transforms, augmentation=augmentation)
     # dataloader_kwargs_from_args returns a dict with batch_size and other kwargs
     dl_kwargs_local = dict(dl_kwargs)
     batch_size = dl_kwargs_local.pop('batch_size', args.batch)
 
     # If real data is provided, create a combined dataset and use a WeightedRandomSampler to mix
     if args.real_data and args.real_ann:
-        real_ds = BBoxDataset(args.real_data, ann_file=args.real_ann, transforms=default_transforms)
+        real_ds = BBoxDataset(args.real_data, ann_file=args.real_ann, transforms=default_transforms, augmentation=augmentation)
         # concat datasets via simple index mapping: synthetic indices [0..N1-1], real indices [N1..N1+N2-1]
         from torch.utils.data import Dataset
 
@@ -479,7 +542,7 @@ def main():
         # optional validation when val_ann provided
         val_loss = None
         if args.val_ann:
-            val_ds = BBoxDataset(args.data, ann_file=args.val_ann, transforms=default_transforms)
+            val_ds = BBoxDataset(args.data, ann_file=args.val_ann, transforms=default_transforms, augmentation=None)  # No augmentation for validation
             v_dl_kwargs = dict(batch_size=batch_size, shuffle=False, collate_fn=collate_fn, **{k: v for k, v in dl_kwargs_local.items() if k != 'shuffle'})
             val_loader = torch.utils.data.DataLoader(val_ds, **v_dl_kwargs)
             model.eval()

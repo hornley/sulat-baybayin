@@ -1,6 +1,7 @@
 import os
 import json
 from PIL import Image
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -18,9 +19,10 @@ class BBoxDataset(Dataset):
     Returns samples compatible with torchvision detection models:
       image (Tensor HxWxC), target dict with keys: boxes, labels, image_id, area, iscrowd
     """
-    def __init__(self, root, ann_file=None, transforms=None, classes=None):
+    def __init__(self, root, ann_file=None, transforms=None, classes=None, augmentation=None):
         self.root = root
         self.transforms = transforms
+        self.augmentation = augmentation  # DetectionAugmentation instance
         self.samples = []  # list of (img_path, [bboxes], [labels])
         self.classes = classes or []
         if ann_file is None:
@@ -114,6 +116,22 @@ class BBoxDataset(Dataset):
         img_path, boxes, labels = self.samples[idx]
         img = Image.open(img_path).convert('RGB')
         w,h = img.size
+        
+        # Apply augmentation if provided (before converting to tensors)
+        if self.augmentation is not None:
+            # Convert PIL to numpy array
+            img_np = np.array(img)
+            boxes_np = np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 4), dtype=np.float32)
+            labels_np = np.array(labels)
+            
+            # Apply augmentation
+            img_np, boxes_np, labels_np = self.augmentation(img_np, boxes_np, labels_np)
+            
+            # Convert back to PIL for transforms
+            img = Image.fromarray(img_np)
+            boxes = boxes_np.tolist() if len(boxes_np) > 0 else []
+            labels = labels_np.tolist() if len(labels_np) > 0 else []
+        
         # convert to tensors
         boxes_t = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0,4), dtype=torch.float32)
         labels_idx = [self.class_to_idx.get(l, 0) for l in labels]
