@@ -12,7 +12,7 @@ def add_common_training_args(parser: argparse.ArgumentParser):
     parser.add_argument('--prefetch-factor', type=int, default=None, help='DataLoader prefetch_factor (if supported)')
     parser.add_argument('--amp', action='store_true', help='Enable mixed precision training (if CUDA available)')
     parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--out', default='checkpoints', help='Output folder for checkpoints')
+    parser.add_argument('--out', required=True, help='Output folder for checkpoints')
     parser.add_argument('--early-stop', type=int, default=0, help='Early stopping patience in epochs (0 to disable)')
     parser.add_argument('--device', default=None, help="Device override ('cpu' or 'cuda')")
     parser.add_argument('--resume-optimizer', action='store_true', help='When resuming from a checkpoint, also restore optimizer state if available')

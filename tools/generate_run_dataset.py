@@ -31,8 +31,8 @@ def run_generation(name, count, paper_type, paper_texture, extra_args=""):
     base_cmd = [
         'python', 'generate_synthetic_sentences.py',
         '--count', str(count),
-        '--out-dir', 'sentences_data_synth',
-        '--ann', 'annotations/synthetic_annotations.csv',
+        '--out-dir', 'sentences_data_synth/test',
+        '--ann', 'sentences_data_synth/test/annotations.csv',
         '--append',
         '--bg-thresh-pct', '99.7',
         '--symbol-height-frac', '0.65',
@@ -43,6 +43,9 @@ def run_generation(name, count, paper_type, paper_texture, extra_args=""):
         '--paper-type', paper_type,
         '--paper-texture', paper_texture,
         '--use-cache',
+        '--ink-color', 'random',
+        '--ink-random-mode', 'per-image',
+        '--ink-random-prob', '0.5'
     ]
     
     # Add extra args
@@ -111,21 +114,21 @@ def main():
         # WHITE PAPER
         {
             'name': 'White Paper - Plain',
-            'count': 1500,
+            'count': 100,
             'paper_type': 'white',
             'paper_texture': 'plain',
             'extra_args': '--paper-lines-prob 0.5 --line-opacity 60 --lighting shadows --shadow-intensity 0.25 --ink-darken-min 0.86 --ink-darken-max 0.92'
         },
         {
             'name': 'White Paper - Crumpled',
-            'count': 1000,
+            'count': 100,
             'paper_type': 'white',
             'paper_texture': 'crumpled',
             'extra_args': '--crumple-strength 3.5 --paper-lines-prob 0.5 --line-opacity 60 --lighting shadows --shadow-intensity 0.25 --ink-darken-min 0.86 --ink-darken-max 0.92'
         },
         {
             'name': 'White Paper - Grainy',
-            'count': 1000,
+            'count': 100,
             'paper_type': 'white',
             'paper_texture': 'grainy',
             'extra_args': '--paper-lines-prob 0.5 --line-opacity 60 --lighting shadows --shadow-intensity 0.25 --ink-darken-min 0.86 --ink-darken-max 0.92'
@@ -134,21 +137,21 @@ def main():
         # YELLOW PAPER
         {
             'name': 'Yellow Paper - Plain',
-            'count': 1500,
+            'count': 100,
             'paper_type': 'yellow-paper',
             'paper_texture': 'plain',
             'extra_args': '--paper-yellow-strength 0 --ink-darken-min 0.86 --ink-darken-max 0.92 --ink-alpha-gain 1.5 --ink-alpha-gamma 0.78 --thin-stroke-thresh 4 --thin-alpha-gain 1.5 --thin-alpha-gamma 0.8 --thin-alpha-floor 160 --thin-darken-boost 0.15 --paper-strength 0.9 --ink-color black --crop-pad 3 --mask-smooth-radius 0.6'
         },
         {
             'name': 'Yellow Paper - Crumpled',
-            'count': 1000,
+            'count': 100,
             'paper_type': 'yellow-paper',
             'paper_texture': 'crumpled',
             'extra_args': '--crumple-strength 3.5 --paper-yellow-strength 0 --ink-darken-min 0.86 --ink-darken-max 0.92 --ink-alpha-gain 1.5 --ink-alpha-gamma 0.78 --thin-stroke-thresh 4 --thin-alpha-gain 1.5 --thin-alpha-gamma 0.8 --thin-alpha-floor 160 --thin-darken-boost 0.15 --paper-strength 0.9 --ink-color black --crop-pad 3 --mask-smooth-radius 0.6'
         },
         {
             'name': 'Yellow Paper - Grainy',
-            'count': 1000,
+            'count': 100,
             'paper_type': 'yellow-paper',
             'paper_texture': 'grainy',
             'extra_args': '--paper-yellow-strength 0 --ink-darken-min 0.86 --ink-darken-max 0.92 --ink-alpha-gain 1.5 --ink-alpha-gamma 0.78 --thin-stroke-thresh 4 --thin-alpha-gain 1.5 --thin-alpha-gamma 0.8 --thin-alpha-floor 160 --thin-darken-boost 0.15 --paper-strength 0.9 --ink-color black --crop-pad 3 --mask-smooth-radius 0.6'
@@ -157,21 +160,21 @@ def main():
         # DOTTED PAPER
         {
             'name': 'Dotted Paper - Plain',
-            'count': 1500,
+            'count': 100,
             'paper_type': 'dotted',
             'paper_texture': 'plain',
             'extra_args': '--lighting shadows --shadow-intensity 0.25 --ink-darken-min 0.86 --ink-darken-max 0.92 --thin-alpha-gain 1.4 --thin-darken-boost 0.12'
         },
         {
             'name': 'Dotted Paper - Crumpled',
-            'count': 1000,
+            'count': 100,
             'paper_type': 'dotted',
             'paper_texture': 'crumpled',
             'extra_args': '--crumple-strength 3.5 --lighting shadows --shadow-intensity 0.25 --ink-darken-min 0.86 --ink-darken-max 0.92 --thin-alpha-gain 1.4 --thin-darken-boost 0.12'
         },
         {
             'name': 'Dotted Paper - Grainy',
-            'count': 1000,
+            'count': 100,
             'paper_type': 'dotted',
             'paper_texture': 'grainy',
             'extra_args': '--lighting shadows --shadow-intensity 0.25 --ink-darken-min 0.86 --ink-darken-max 0.92 --thin-alpha-gain 1.4 --thin-darken-boost 0.12'

@@ -6,7 +6,7 @@
 # Use --regen-args to regenerate this file from CLI args
 
 # === OUTPUT & GENERATION ===
-count: 5000
+count: 20
 out_dir: sentences_data_synth
 ann: null
 append: false
@@ -30,7 +30,10 @@ erode_glyph_min_thickness: 4.0
 erode_glyph_prob: 1.0
 
 # === INK APPEARANCE ===
-ink_color: black
+ink_color: random
+ink_color_variation: 15
+ink_random_mode: per-image
+ink_random_prob: 0.8
 ink_darken_min: 0.82
 ink_darken_max: 0.96
 ink_alpha_gain: 1.0
@@ -44,11 +47,11 @@ thin_darken_boost: 0.08
 thin_alpha_floor: 130
 
 # === PAPER TYPE & TEXTURE ===
-paper_type: white
+paper_type: yellow-paper
 paper_type_mix: null
 paper_texture: plain
 paper_strength: null
-paper_yellow_strength: null
+paper_yellow_strength: 0
 
 # === RULED LINES ===
 paper_lines_prob: 0.0
@@ -69,8 +72,8 @@ crumple_strength: 3
 crumple_mesh_overlap: 2
 
 # === LIGHTING ===
-lighting: normal
+lighting: shadows
 brightness_jitter: 0.03
 contrast_jitter: 0.03
-shadow_intensity: 0.0
+shadow_intensity: 1.2
 

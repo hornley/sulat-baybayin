@@ -36,7 +36,7 @@ def generate_yaml_template(output_path: str, config_dict: Dict[str, Any], header
             ('OUTPUT & GENERATION', ['count', 'out_dir', 'ann', 'append', 'min_symbols', 'max_symbols']),
             ('SYMBOL NORMALIZATION', ['symbol_height_frac', 'bg_thresh_pct', 'crop_pad', 'mask_smooth_radius', 'use_cache', 'cache_dir']),
             ('SHADOW & EROSION', ['erode_shadow', 'erode_shadow_min_thickness', 'erode_shadow_prob', 'erode_glyph', 'erode_glyph_min_thickness', 'erode_glyph_prob']),
-            ('INK APPEARANCE', ['ink_color', 'ink_darken_min', 'ink_darken_max', 'ink_alpha_gain', 'ink_alpha_gamma']),
+            ('INK APPEARANCE', ['ink_color', 'ink_color_variation', 'ink_random_mode', 'ink_random_prob', 'ink_darken_min', 'ink_darken_max', 'ink_alpha_gain', 'ink_alpha_gamma']),
             ('THIN STROKE HELPERS', ['thin_stroke_thresh', 'thin_alpha_gain', 'thin_alpha_gamma', 'thin_darken_boost', 'thin_alpha_floor']),
             ('PAPER TYPE & TEXTURE', ['paper_type', 'paper_type_mix', 'paper_texture', 'paper_strength', 'paper_yellow_strength']),
             ('RULED LINES', ['paper_lines_prob', 'line_spacing', 'line_opacity', 'line_thickness', 'line_jitter', 'line_color']),
@@ -228,19 +228,42 @@ def merge_configs(yaml_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
     """
     # Flatten YAML config to handle nested structures
     flat_yaml = flatten_dict(yaml_config) if any(isinstance(v, dict) for v in yaml_config.values()) else yaml_config
-    
+
     # Start with YAML values
     merged = dict(flat_yaml)
-    
-    # Add/override with CLI args
+
+    # Determine which CLI args were explicitly provided on the command line.
+    # We use sys.argv to detect presence of flags (both underscore and dash variants).
+    raw_argv = sys.argv[1:]
+
+    # Merge: YAML provides base values. Only override with CLI when the user
+    # explicitly passed that CLI option (so default argparse values don't
+    # unintentionally override values a user set in the YAML file).
     for key, cli_value in cli_args.items():
-        # Skip if key is in CLI args (add it)
+        # If the key was not present in YAML, add it regardless
         if key not in merged:
             merged[key] = cli_value
-        # If key exists in both, CLI overrides YAML only if different
-        elif cli_value != merged.get(key):
+            continue
+
+        # Check whether the corresponding CLI flag was provided. Flags can be
+        # expressed with underscores or dashes, e.g. --paper_type or --paper-type
+        dash_key = key.replace('_', '-')
+        flag1 = f'--{key}'
+        flag2 = f'--{dash_key}'
+        provided = False
+        for a in raw_argv:
+            # matches forms like --flag or --flag=VALUE or --flag VALUE
+            if a == flag1 or a.startswith(flag1 + '=') or a == flag2 or a.startswith(flag2 + '='):
+                provided = True
+                break
+
+        if provided:
+            # CLI explicitly provided this value; override YAML
             merged[key] = cli_value
-    
+        else:
+            # CLI did not provide this option; keep YAML value (already present)
+            pass
+
     return merged
 
 

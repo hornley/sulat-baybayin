@@ -1,7 +1,16 @@
 import argparse
 import torch
 import os
+import sys
 from collections import defaultdict
+
+# Ensure project root is on sys.path so `import src...` works when the script
+# is executed directly (e.g. `python src/detection/eval_checkpoint.py`).
+# This avoids ModuleNotFoundError: No module named 'src' in common CLI usage.
+proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if proj_root not in sys.path:
+    sys.path.insert(0, proj_root)
+
 from src.detection.dataset import BBoxDataset
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 

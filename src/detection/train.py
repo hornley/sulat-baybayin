@@ -213,12 +213,16 @@ def main():
     parser.add_argument('--early-stop-monitor', choices=['val_loss', 'train_loss', 'acc'], default='val_loss', help='Metric to monitor for early stopping')
     # google drive backup option
     parser.add_argument('--gdrive-backup', default=None, help='Google Drive path to backup checkpoints (e.g., /content/drive/MyDrive/SulatBaybayin/)')
+    # Convenience flags for hosted runtimes
+    parser.add_argument('--colab', action='store_true', help='Enable Colab-specific defaults (attempt to mount Google Drive and set sensible paths)')
+    parser.add_argument('--kaggle', action='store_true', help='Enable Kaggle-specific defaults (write outputs to /kaggle/working and reduce workers)')
     
     # === AUGMENTATION OPTIONS ===
     parser.add_argument('--aug-enable', action='store_true', help='Enable augmentation during training')
     parser.add_argument('--aug-photometric', action='store_true', default=True, help='Enable photometric augmentations (brightness, contrast, gamma, blur, noise)')
     parser.add_argument('--aug-lighting', action='store_true', default=True, help='Enable lighting effects (shadows, overhead, spotlight, vignette, ambient)')
     parser.add_argument('--aug-geometric', action='store_true', default=True, help='Enable geometric transformations (rotation, flip, scale, translate, shear)')
+    parser.add_argument('--aug-start-epoch', type=int, default=0, help='Epoch index to start applying augmentations (0 = from start). Use this to have stage 1 (no aug) then stage 2 (with aug) within one run')
     
     # Photometric parameters
     parser.add_argument('--aug-brightness-min', type=float, default=0.7, help='Minimum brightness multiplier')
@@ -312,6 +316,24 @@ def main():
             setattr(args, key, value)
         
         print('✓ YAML config loaded and merged with CLI arguments')
+
+    # Hosted-runtime adjustments (Colab / Kaggle)
+    if args.colab:
+        print('Detected --colab: applying Colab-friendly defaults')
+
+        # If user did not specify a gdrive backup path, use a sensible default under MyDrive
+        if not args.gdrive_backup:
+            args.gdrive_backup = '/content/drive/MyDrive/SulatBaybayin/'
+            print(f'Setting --gdrive-backup to default: {args.gdrive_backup}')
+
+        # reduce worker count to avoid Colab worker spawning issues
+        try:
+            args.num_workers = min(int(getattr(args, 'num_workers', 2)), 2)
+        except Exception:
+            try:
+                args.num_workers = 2
+            except Exception:
+                pass
 
     # If user asked to monitor val_loss but didn't provide a validation annotation file, warn them
     if args.early_stop_monitor == 'val_loss' and not args.val_ann:
@@ -515,6 +537,25 @@ def main():
     # prepare mix logging
     mix_log = []
     for epoch in range(start_epoch, args.epochs):
+        # Toggle augmentation based on epoch. This allows running a stage-1 (no augment)
+        # followed by a stage-2 (with augment) in a single run by using --aug-start-epoch.
+        try:
+            if args.aug_start_epoch and epoch < args.aug_start_epoch:
+                # disable augmentation for known dataset objects
+                if 'train_ds' in locals():
+                    train_ds.augmentation = None
+                if 'real_ds' in locals():
+                    real_ds.augmentation = None
+            else:
+                # enable augmentation (if augmentation pipeline was created)
+                if 'train_ds' in locals():
+                    train_ds.augmentation = augmentation
+                if 'real_ds' in locals():
+                    # for real images you may or may not want augmentations; we default to enabling the same augmentation
+                    real_ds.augmentation = augmentation
+        except Exception:
+            # best-effort: do not crash training due to augmentation toggling
+            pass
         avg_total, avg_cls, avg_box, matched, total_gt, elapsed = train_one_epoch(model, optimizer, train_loader, device, epoch, scaler=scaler, skip_batch_eval=args.no_batch_eval)
         # if using quotas strategy we recorded a subset; compute how many samples from each source were used
         if args.real_data and args.real_ann and args.mix_strategy in ('alternating', 'quotas'):
@@ -629,12 +670,18 @@ def main():
             print(f'Saved last.pth (epoch {epoch+1})')
             
             # Backup to Google Drive after each epoch if specified
-            if args.gdrive_backup:
+            # Only perform GDrive backup when explicitly running in Colab mode (and not Kaggle).
+            if args.gdrive_backup and getattr(args, 'colab', False) and not getattr(args, 'kaggle', False):
                 success, result = backup_to_gdrive(args.out, args.gdrive_backup)
                 if success:
                     print(f'✓ Backed up to GDrive: {result}')
                 else:
                     print(f'⚠ GDrive backup failed: {result}')
+            else:
+                if args.gdrive_backup and not getattr(args, 'colab', False):
+                    print('Note: --gdrive-backup provided but --colab not set; skipping automatic Drive backup')
+                if getattr(args, 'kaggle', False):
+                    print('Note: running in Kaggle mode; skipping Google Drive backup')
 
     # At training end (normal completion or early stop), write final checkpoint to best.pth
     try:
@@ -643,8 +690,8 @@ def main():
     except Exception:
         print('Warning: could not write final best.pth')
 
-    # Final backup to Google Drive
-    if args.gdrive_backup:
+    # Final backup to Google Drive: only perform when --colab is set and not --kaggle
+    if args.gdrive_backup and getattr(args, 'colab', False) and not getattr(args, 'kaggle', False):
         print(f'\n{"="*70}')
         print('Final backup to Google Drive...')
         print(f'{"="*70}')
@@ -654,6 +701,11 @@ def main():
         else:
             print(f'⚠ Backup failed: {result}')
         print(f'{"="*70}\n')
+    else:
+        if args.gdrive_backup and not getattr(args, 'colab', False):
+            print('Note: --gdrive-backup provided but --colab not set; skipping final Drive backup')
+        if getattr(args, 'kaggle', False):
+            print('Note: running in Kaggle mode; skipping final Google Drive backup')
 
     # write mix log if collected
     try:

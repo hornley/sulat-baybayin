@@ -37,10 +37,17 @@ class DetectionAugmentation:
         shadow_size_small_prob: float = 0.4,   # Small shadows
         shadow_size_medium_prob: float = 0.4,  # Medium shadows
         shadow_size_large_prob: float = 0.2,   # Large shadows
+        # Probability of using a single large cast shadow (e.g. phone shadow)
+        shadow_single_prob: float = 0.3,
         overhead_prob: float = 0.2,
         overhead_intensity_range: Tuple[float, float] = (0.1, 0.3),
         spotlight_prob: float = 0.15,
         spotlight_radius_range: Tuple[float, float] = (0.3, 0.6),
+        # Spotlight intensity range (multiplier applied to the spotlight mask).
+        # Higher values make the spotlight effect stronger/brighter.
+        spotlight_intensity_range: Tuple[float, float] = (0.2, 0.5),
+        # If True, reduce spotlight strength when the local region is already bright
+        spotlight_adapt_to_brightness: bool = False,
         vignette_prob: float = 0.25,
         vignette_intensity_range: Tuple[float, float] = (0.2, 0.5),
         ambient_color_shift_range: Tuple[float, float] = (0, 15),
@@ -73,10 +80,13 @@ class DetectionAugmentation:
         self.shadow_size_small_prob = shadow_size_small_prob
         self.shadow_size_medium_prob = shadow_size_medium_prob
         self.shadow_size_large_prob = shadow_size_large_prob
+        self.shadow_single_prob = shadow_single_prob
         self.overhead_prob = overhead_prob
         self.overhead_intensity_range = overhead_intensity_range
         self.spotlight_prob = spotlight_prob
         self.spotlight_radius_range = spotlight_radius_range
+        self.spotlight_intensity_range = spotlight_intensity_range
+        self.spotlight_adapt_to_brightness = spotlight_adapt_to_brightness
         self.vignette_prob = vignette_prob
         self.vignette_intensity_range = vignette_intensity_range
         self.ambient_color_shift_range = ambient_color_shift_range
@@ -161,11 +171,14 @@ class DetectionAugmentation:
         """Apply lighting effects."""
         h, w = image.shape[:2]
         
-        # Shadow casting (1-3 shadows)
+        # Shadow casting: either a single large cast (phone-like) or multiple small casts
         if random.random() < self.shadow_prob:
-            num_shadows = random.randint(1, 3)
-            for _ in range(num_shadows):
-                image = self._add_shadow(image)
+            if random.random() < self.shadow_single_prob:
+                image = self._add_single_cast_shadow(image)
+            else:
+                num_shadows = random.randint(1, 3)
+                for _ in range(num_shadows):
+                    image = self._add_shadow(image)
         
         # Overhead lighting gradient
         if random.random() < self.overhead_prob:
@@ -212,13 +225,13 @@ class DetectionAugmentation:
         
         if size_choice < norm_small:
             # Small shadow (15-35% of image)
-            coverage = random.uniform(0.15, 0.35)
+            coverage = random.uniform(0.25, 0.45)
         elif size_choice < norm_small + norm_medium:
             # Medium shadow (35-60% of image)
-            coverage = random.uniform(0.35, 0.60)
+            coverage = random.uniform(0.45, 0.70)
         else:
             # Large shadow (60-85% of image)
-            coverage = random.uniform(0.60, 0.85)
+            coverage = random.uniform(0.70, 0.95)
         
         # Create random polygon for shadow shape
         num_points = random.randint(3, 6)
@@ -255,6 +268,47 @@ class DetectionAugmentation:
         shadow_factor = 1.0 - (mask * intensity)
         image = image * shadow_factor[:, :, np.newaxis]
         
+        return image
+
+    def _add_single_cast_shadow(self, image: np.ndarray) -> np.ndarray:
+        """Add a single large cast shadow (e.g. phone or object cast over the page).
+
+        This creates a large elliptical shadow with soft edges placed toward
+        an edge/near-top region to simulate a phone/camera hand casting a shadow.
+        """
+        h, w = image.shape[:2]
+        intensity = random.uniform(*self.shadow_intensity_range)
+
+        # Large coverage for cast shadow (50% - 95% of image)
+        coverage = random.uniform(0.5, 0.95)
+
+        # Place the cast shadow toward an edge (phone usually near top/side).
+        center_x = int(random.uniform(0.2, 0.8) * w)
+        center_y = int(random.uniform(0.0, 0.35) * h)
+
+        radius_x = int(max(1, coverage * w / 2))
+        radius_y = int(max(1, coverage * h / 2))
+
+        # Build mask with filled ellipse
+        mask = np.zeros((h, w), dtype=np.float32)
+        try:
+            cv2.ellipse(mask, (center_x, center_y), (radius_x, radius_y), int(random.uniform(-30, 30)), 0, 360, 1.0, -1)
+        except Exception:
+            # Fallback: draw a filled circle if ellipse fails
+            cv2.circle(mask, (center_x, center_y), max(radius_x, radius_y), 1.0, -1)
+
+        # Soften edges: blur amount scales with coverage and image size
+        blur_kernel = int(min(max(h, w) * 0.5 * coverage, 201))
+        if blur_kernel % 2 == 0:
+            blur_kernel += 1
+        # Ensure kernel is at least 3
+        blur_kernel = max(3, blur_kernel)
+        mask = cv2.GaussianBlur(mask, (blur_kernel, blur_kernel), 0)
+
+        # Apply multiplicative shadow darkening
+        shadow_factor = 1.0 - (mask * intensity)
+        image = image * shadow_factor[:, :, np.newaxis]
+
         return image
     
     def _add_directional_light(
@@ -301,10 +355,30 @@ class DetectionAugmentation:
         spotlight = np.clip(1.0 - (dist / radius), 0, 1)
         spotlight = spotlight[:, :, np.newaxis]
         
-        # Brighten center, darken edges
-        intensity = 0.3
-        image = image * (1.0 + spotlight * intensity)
-        
+        # Brighten center additively (more visible on light backgrounds).
+        # Use additive brightness instead of multiplicative so the spotlight
+        # shows up even when paper is near-white (avoids saturation hiding effect).
+        intensity = random.uniform(*self.spotlight_intensity_range)
+
+        # Optionally adapt intensity to local brightness so very bright
+        # backgrounds don't produce an overexposed spot.
+        if getattr(self, 'spotlight_adapt_to_brightness', False):
+            # Compute mean brightness inside the spotlight mask
+            mask_mean = np.sum(image * spotlight) / (np.sum(spotlight) + 1e-9)
+            # mask_mean is average per-channel; reduce to 0..255 by averaging channels
+            if image.ndim == 3:
+                # mask_mean currently sums across channels equally; divide by 3
+                local_mean = mask_mean / 3.0
+            else:
+                local_mean = mask_mean
+            # Scale down intensity linearly with local brightness
+            adapt_scale = 1.0 - (local_mean / 255.0)
+            # Clamp so we still get some visible effect (avoid zeroing)
+            adapt_scale = float(np.clip(adapt_scale, 0.15, 1.0))
+            intensity = intensity * adapt_scale
+
+        image = image + (spotlight * 255.0 * intensity)
+
         return image
     
     def _add_vignette(self, image: np.ndarray, intensity: float) -> np.ndarray:

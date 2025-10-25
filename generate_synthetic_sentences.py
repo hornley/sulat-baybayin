@@ -378,18 +378,17 @@ def main(argv=None):
         per_image_random_color = None
         per_image_use_random = False
         try:
-            if str(args.ink_color).strip().lower() == 'random':
-                random_mode = str(args.ink_random_mode).strip().lower()
-                if random_mode == 'per-image':
-                    # Check probability to decide if this image gets random color
-                    try:
-                        prob = float(args.ink_random_prob)
-                    except Exception:
-                        prob = 0.2
-                    
-                    if random.random() < prob:
-                        per_image_use_random = True
-                        per_image_random_color = _generate_random_ink_color()
+            if str(args.ink_color).strip().lower() == 'random' and str(args.ink_random_mode).strip().lower() == 'per-image':
+                try:
+                    prob = float(args.ink_random_prob)
+                except Exception:
+                    prob = 0.2
+                if random.random() < prob:
+                    per_image_random_color = _generate_random_ink_color()
+                    per_image_use_random = True
+                else:
+                    per_image_random_color = None
+                    per_image_use_random = False
         except Exception:
             per_image_random_color = None
             per_image_use_random = False
