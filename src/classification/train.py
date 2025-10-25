@@ -1,6 +1,7 @@
 import os
 import argparse
 import time
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -329,7 +330,8 @@ def main():
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler=scaler)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         elapsed = time.time() - t0
-        print(f'Epoch {epoch}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} time={elapsed:.1f}s')
+        epoch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f'Epoch {epoch}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} time={elapsed:.1f}s [{epoch_time}]')
 
         # scheduler step
         if scheduler is not None:

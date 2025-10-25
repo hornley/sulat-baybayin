@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from datetime import datetime
 import torch
 import torchvision
 import torchvision.transforms as T
@@ -14,11 +15,14 @@ from src.shared.config_manager import generate_yaml_template, load_yaml_config, 
 
 
 def backup_to_gdrive(output_path, gdrive_path):
-    """Backup checkpoint directory to Google Drive.
+    """Backup checkpoint directory to Google Drive by overwriting files.
     
     Args:
         output_path: Local checkpoint path (e.g., checkpoints/detection/colab_run11/stage1)
         gdrive_path: Google Drive backup path (e.g., /content/drive/MyDrive/SulatBaybayin/)
+    
+    Note: Uses copy2 to overwrite files directly instead of deleting the directory first.
+          This prevents filling up the trash bin in Google Drive.
     """
     try:
         import shutil
@@ -34,12 +38,32 @@ def backup_to_gdrive(output_path, gdrive_path):
                 # Create backup destination
                 backup_dest = os.path.join(gdrive_path, run_name)
                 
-                # Copy the entire run directory
+                # Copy the entire run directory by overwriting files
                 if os.path.exists(base_checkpoint_dir):
                     os.makedirs(gdrive_path, exist_ok=True)
-                    if os.path.exists(backup_dest):
-                        shutil.rmtree(backup_dest)
-                    shutil.copytree(base_checkpoint_dir, backup_dest)
+                    
+                    # Instead of deleting, copy files and overwrite
+                    # Use copytree with dirs_exist_ok=True (Python 3.8+)
+                    try:
+                        shutil.copytree(base_checkpoint_dir, backup_dest, dirs_exist_ok=True)
+                    except TypeError:
+                        # Fallback for Python < 3.8: manually copy files
+                        if not os.path.exists(backup_dest):
+                            os.makedirs(backup_dest, exist_ok=True)
+                        for root, dirs, files in os.walk(base_checkpoint_dir):
+                            # Get relative path from base
+                            rel_path = os.path.relpath(root, base_checkpoint_dir)
+                            dest_dir = os.path.join(backup_dest, rel_path) if rel_path != '.' else backup_dest
+                            
+                            # Create subdirectories
+                            os.makedirs(dest_dir, exist_ok=True)
+                            
+                            # Copy files (overwrite existing)
+                            for file in files:
+                                src_file = os.path.join(root, file)
+                                dst_file = os.path.join(dest_dir, file)
+                                shutil.copy2(src_file, dst_file)
+                    
                     return True, backup_dest
                 else:
                     return False, f"Source not found: {base_checkpoint_dir}"
@@ -179,8 +203,9 @@ def main():
     # real/synthetic mixing
     parser.add_argument('--real-data', default=None, help='Root folder for photographed/real images to mix with synthetic')
     parser.add_argument('--real-ann', default=None, help='Annotations CSV/COCO for real images')
-    parser.add_argument('--real-weight', type=float, default=0.2, help='Fraction of samples from real data per epoch (0-1)')
+    parser.add_argument('--real-weight', type=float, default=0.2, help='Fraction of samples from real data per epoch (0-1). With --real-samples-fixed, this is fraction of real dataset to use')
     parser.add_argument('--mix-strategy', choices=['concat', 'alternating', 'quotas'], default='quotas', help='How to mix synthetic and real datasets')
+    parser.add_argument('--real-samples-fixed', action='store_true', help='Use fixed real sample count instead of percentage-based mixing. real_weight determines fraction of real dataset, synth uses full dataset')
     # early stopping options
     parser.add_argument('--early-stop-patience', type=int, default=0, help='Number of epochs with no improvement after which training will be stopped (0 disables)')
     parser.add_argument('--early-stop-min-delta', type=float, default=0.0, help='Minimum change in monitored metric to qualify as improvement')
@@ -312,10 +337,18 @@ def main():
             mix_log_path = os.path.join(args.out, 'mix_log_alternating.csv')
         else:
             # quotas: deterministic per-epoch quotas without replacement
-            total = len(combined)
-            # calculate quotas per epoch
-            real_quota = int(round(args.real_weight * total))
-            synth_quota = total - real_quota
+            if args.real_samples_fixed:
+                # Fixed mode: use real_weight as fraction of real dataset, synth uses full dataset
+                real_quota = int(round(args.real_weight * n_real))
+                synth_quota = n_synth  # Use entire synthetic dataset
+                print(f'Fixed mixing: Using {synth_quota} synthetic samples + {real_quota} real samples ({args.real_weight*100:.1f}% of {n_real} real images) per epoch')
+            else:
+                # Percentage mode: real_weight determines fraction of combined dataset
+                total = len(combined)
+                real_quota = int(round(args.real_weight * total))
+                synth_quota = total - real_quota
+                print(f'Percentage mixing: Using {synth_quota} synthetic + {real_quota} real samples ({args.real_weight*100:.1f}% real) per epoch')
+            
             # sample without replacement deterministically each epoch: we'll create a list of indices for one epoch
             synth_indices = list(range(0, n_synth))
             real_indices = list(range(n_synth, n_synth + n_real))
@@ -440,7 +473,8 @@ def main():
                 pass
         acc = matched / total_gt if total_gt else 0.0
         # print baseline epoch training summary; validation printed below if present
-        print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} time={elapsed:.1f}s')
+        epoch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} time={elapsed:.1f}s [{epoch_time}]')
 
         # optional validation when val_ann provided
         val_loss = None
@@ -464,7 +498,7 @@ def main():
                 print(f'Validation: val_loss={val_loss:.4f}')
         # if validation was run, include val_loss in a combined summary line
         if val_loss is not None:
-            print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} val_loss={val_loss:.4f} time={elapsed:.1f}s')
+            print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} val_loss={val_loss:.4f} time={elapsed:.1f}s [{epoch_time}]')
             model.train()
 
         # determine monitored metric for early stopping
