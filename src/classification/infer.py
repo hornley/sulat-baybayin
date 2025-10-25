@@ -6,6 +6,54 @@ from torchvision import transforms
 from src.classification.model import BaybayinClassifier
 
 
+def generate_output_dir(checkpoint_path, base_dir='classifications'):
+    """
+    Generate output directory based on checkpoint path.
+    
+    Example:
+        checkpoints/classification/colab_run10/stage2/best.pth
+        -> classifications/colab_run10/stage2/infer1
+        
+        checkpoints/single_symbol/best.pth
+        -> classifications/single_symbol/infer1
+    """
+    # Parse checkpoint path to extract run identifier and stage
+    ckpt_parts = os.path.normpath(checkpoint_path).split(os.sep)
+    
+    # Find 'checkpoints' in path and extract everything after it (excluding the filename)
+    try:
+        ckpt_idx = ckpt_parts.index('checkpoints')
+        # Get path components after 'checkpoints' but before filename
+        run_parts = ckpt_parts[ckpt_idx + 1:-1]  # Exclude 'checkpoints' and filename
+        # Remove 'detection' or 'classification' from run_parts if present
+        run_parts = [p for p in run_parts if p not in ('detection', 'classification')]
+    except (ValueError, IndexError):
+        # If 'checkpoints' not in path, use parent directory of checkpoint file
+        run_parts = [os.path.basename(os.path.dirname(checkpoint_path))]
+    
+    # Build base path for this run
+    if run_parts:
+        run_path = os.path.join(base_dir, *run_parts)
+    else:
+        run_path = base_dir
+    
+    # Find next available infer number
+    os.makedirs(run_path, exist_ok=True)
+    existing = [d for d in os.listdir(run_path) if d.startswith('infer') and os.path.isdir(os.path.join(run_path, d))]
+    
+    # Extract numbers from existing infer folders
+    numbers = []
+    for d in existing:
+        try:
+            num = int(d.replace('infer', ''))
+            numbers.append(num)
+        except ValueError:
+            continue
+    
+    next_num = max(numbers) + 1 if numbers else 1
+    return os.path.join(run_path, f'infer{next_num}')
+
+
 def load_checkpoint(path, device='cpu'):
     ckpt = torch.load(path, map_location=device)
     classes = ckpt.get('classes')
@@ -35,11 +83,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', required=True, help='Path to checkpoint (best.pth)')
     parser.add_argument('--input', required=True, help='Image file or folder of images')
-    parser.add_argument('--output', default='classifications', help='Output folder for per-image predictions')
+    parser.add_argument('--output', default=None, help='Output folder for per-image predictions (auto-generated if not specified)')
     parser.add_argument('--topk', type=int, default=3)
     parser.add_argument('--img-size', type=int, default=224)
     parser.add_argument('--compile-inferred', action='store_true', help='Write a compiled CSV/text of all predictions')
     args = parser.parse_args()
+
+    # Auto-generate output directory if not provided
+    if args.output is None:
+        args.output = generate_output_dir(args.ckpt, base_dir='classifications')
+        print(f'Auto-generated output directory: {args.output}')
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, classes = load_checkpoint(args.ckpt, device=device)

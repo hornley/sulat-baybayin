@@ -31,7 +31,8 @@ def run_generation(name, count, paper_type, paper_texture, extra_args=""):
     base_cmd = [
         'python', 'generate_synthetic_sentences.py',
         '--count', str(count),
-        '--out-dir', 'sentences_data_synth_run11',
+        '--out-dir', 'sentences_data_synth',
+        '--ann', 'annotations/synthetic_annotations.csv',
         '--append',
         '--bg-thresh-pct', '99.7',
         '--symbol-height-frac', '0.65',
@@ -49,7 +50,7 @@ def run_generation(name, count, paper_type, paper_texture, extra_args=""):
         base_cmd.extend(extra_args.split())
     
     # Get annotation count before
-    ann_file = os.path.join('sentences_data_synth_run11', 'annotations.csv')
+    ann_file = 'annotations/synthetic_annotations.csv'
     before_count = count_annotations(ann_file)
     
     # Run command
@@ -93,7 +94,7 @@ def run_generation(name, count, paper_type, paper_texture, extra_args=""):
             'name': name,
             'count': count,
             'added': 0,
-            'total': count_annotations(ann_file),
+            'total': count_annotations('annotations/synthetic_annotations.csv'),
             'success': False
         }
 
@@ -208,7 +209,7 @@ def main():
     print(f"Total annotations added: {total_added}")
     
     # Final annotation count
-    ann_file = os.path.join('sentences_data_synth_run11', 'annotations.csv')
+    ann_file = 'annotations/synthetic_annotations.csv'
     final_count = count_annotations(ann_file)
     print(f"Final annotation count: {final_count}")
     

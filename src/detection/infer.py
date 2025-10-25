@@ -1,7 +1,56 @@
 import argparse
 import torch
+import os
 from PIL import Image, ImageDraw
 from src.detection.dataset import BBoxDataset
+
+
+def generate_output_dir(checkpoint_path, base_dir='detections'):
+    """
+    Generate output directory based on checkpoint path.
+    
+    Example:
+        checkpoints/detection/colab_run10/stage2/best.pth
+        -> detections/colab_run10/stage2/infer1
+        
+        checkpoints/stage2/best.pth
+        -> detections/stage2/infer1
+    """
+    # Parse checkpoint path to extract run identifier and stage
+    ckpt_parts = os.path.normpath(checkpoint_path).split(os.sep)
+    
+    # Find 'checkpoints' in path and extract everything after it (excluding the filename)
+    try:
+        ckpt_idx = ckpt_parts.index('checkpoints')
+        # Get path components after 'checkpoints' but before filename
+        run_parts = ckpt_parts[ckpt_idx + 1:-1]  # Exclude 'checkpoints' and filename
+        # Remove 'detection' or 'classification' from run_parts if present
+        run_parts = [p for p in run_parts if p not in ('detection', 'classification')]
+    except (ValueError, IndexError):
+        # If 'checkpoints' not in path, use parent directory of checkpoint file
+        run_parts = [os.path.basename(os.path.dirname(checkpoint_path))]
+    
+    # Build base path for this run
+    if run_parts:
+        run_path = os.path.join(base_dir, *run_parts)
+    else:
+        run_path = base_dir
+    
+    # Find next available infer number
+    os.makedirs(run_path, exist_ok=True)
+    existing = [d for d in os.listdir(run_path) if d.startswith('infer') and os.path.isdir(os.path.join(run_path, d))]
+    
+    # Extract numbers from existing infer folders
+    numbers = []
+    for d in existing:
+        try:
+            num = int(d.replace('infer', ''))
+            numbers.append(num)
+        except ValueError:
+            continue
+    
+    next_num = max(numbers) + 1 if numbers else 1
+    return os.path.join(run_path, f'infer{next_num}')
 
 
 def load_checkpoint(path, device='cpu'):
@@ -27,6 +76,26 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
     with torch.no_grad():
         outputs = model([tensor])
     out = outputs[0]
+    
+    # Calculate scaled font size and line width based on image dimensions
+    img_width, img_height = img.size
+    img_diagonal = (img_width ** 2 + img_height ** 2) ** 0.5
+    # Scale font size: base size 12 for ~1000px diagonal, scale proportionally
+    font_size = max(10, int(img_diagonal / 80))
+    line_width = max(1, int(img_diagonal / 500))
+    
+    # Try to load a scalable font, fall back to default if not available
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except:
+        try:
+            from PIL import ImageFont
+            # Try default font with size
+            font = ImageFont.load_default()
+        except:
+            font = None
+    
     draw = ImageDraw.Draw(img)
     preds = []  # list of dicts with box, centers, size, label_name, score
     for box, label, score in zip(out['boxes'], out['labels'], out['scores']):
@@ -38,8 +107,14 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
         xc = x1 + w / 2.0
         yc = y1 + h / 2.0
         cname = classes[label - 1] if label > 0 and label - 1 < len(classes) else str(int(label))
-        draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
-        draw.text((x1 + 3, y1 + 3), f"{cname}:{score:.2f}", fill='red')
+        draw.rectangle([x1, y1, x2, y2], outline='red', width=line_width)
+        # Draw text with scaled font
+        text = f"{cname}:{score:.2f}"
+        text_offset = max(2, int(img_diagonal / 400))
+        if font:
+            draw.text((x1 + text_offset, y1 + text_offset), text, fill='red', font=font)
+        else:
+            draw.text((x1 + text_offset, y1 + text_offset), text, fill='red')
         preds.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'xc': xc, 'yc': yc, 'w': w, 'h': h, 'label': cname, 'score': float(score)})
 
     # If no preds, return empty structures (6-tuple)
@@ -164,7 +239,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', required=True)
     parser.add_argument('--input', required=True, help='Image file or folder')
-    parser.add_argument('--out', default='detections')
+    parser.add_argument('--out', default=None, help='Output directory (auto-generated if not specified)')
     parser.add_argument('--thresh', type=float, default=0.5)
     parser.add_argument('--no-permutations', action='store_true', help='Do not write all permutations to per-image txt')
     parser.add_argument('--global-format', choices=['txt', 'csv', 'json'], default='txt', help='Format for global predictions file')
@@ -173,9 +248,14 @@ def main():
     parser.add_argument('--min-thresh-px', type=int, default=10, help='Minimum pixel threshold for clustering')
     parser.add_argument('--compile-inferred', action='store_true', help='Produce a single compiled inferred text file (compiled_inferred.txt) instead of separate per-image inference txts')
     args = parser.parse_args()
+    
+    # Auto-generate output directory if not provided
+    if args.out is None:
+        args.out = generate_output_dir(args.ckpt, base_dir='detections')
+        print(f'Auto-generated output directory: {args.out}')
+    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, classes = load_checkpoint(args.ckpt, device=device)
-    import os
     os.makedirs(args.out, exist_ok=True)
     paths = []
     if os.path.isdir(args.input):

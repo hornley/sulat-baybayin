@@ -63,7 +63,6 @@ def main(argv=None):
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, 'w', newline='', encoding='utf8') as fo:
             writer = csv.writer(fo)
-            writer.writerow(['image_path','x1','y1','x2','y2','label'])
             for img in subset_imgs:
                 for row in images[img]:
                     writer.writerow(row)
