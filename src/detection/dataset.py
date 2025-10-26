@@ -58,19 +58,36 @@ class BBoxDataset(Dataset):
                 parts=[p.strip() for p in line.split(',')]
                 if len(parts) < 6: continue
                 img, x1,y1,x2,y2,label = parts[0], float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), parts[5]
-                # Resolve image path robustly:
-                # - if CSV provides absolute path, use it
-                # - if root + img exists, use that (common case)
-                # - if raw img path exists (CSV already included root or is correct relative path), use it
-                # - otherwise fall back to joining root and img
-                if os.path.isabs(img):
-                    imgpath = img
+                # Resolve image path robustly.
+                # Handle cases where CSV contains paths that begin with a slash
+                # (e.g. "\textured_synth_data/...") which on Windows look like
+                # absolute paths but are actually intended to be relative to the
+                # dataset root. Strategy:
+                #  - normalize the path
+                #  - if it's absolute and exists, use it
+                #  - if it's absolute but doesn't exist, strip leading separators
+                #    and try joining with root
+                #  - otherwise try joining with root, then raw path, then fall back
+                img_norm = os.path.normpath(img)
+                if os.path.isabs(img_norm):
+                    if os.path.exists(img_norm):
+                        imgpath = img_norm
+                    else:
+                        # Try treating it as a root-relative/relative path by
+                        # stripping leading slashes and joining with dataset root
+                        img_rel = img_norm.lstrip('\\/')
+                        candidate = os.path.join(self.root, img_rel)
+                        if os.path.exists(candidate):
+                            imgpath = candidate
+                        else:
+                            # fallback to candidate (most likely correct)
+                            imgpath = candidate
                 else:
-                    joined = os.path.join(self.root, img)
+                    joined = os.path.join(self.root, img_norm)
                     if os.path.exists(joined):
                         imgpath = joined
-                    elif os.path.exists(img):
-                        imgpath = img
+                    elif os.path.exists(img_norm):
+                        imgpath = img_norm
                     else:
                         imgpath = joined
                 if imgpath not in entries:
@@ -101,7 +118,16 @@ class BBoxDataset(Dataset):
             im = imgs.get(img_id)
             if not im: continue
             imgname = im.get('file_name')
-            imgpath = imgname if os.path.isabs(imgname) else os.path.join(self.root, imgname)
+            # Normalize and resolve similarly to CSV loader
+            img_norm = os.path.normpath(imgname)
+            if os.path.isabs(img_norm):
+                if os.path.exists(img_norm):
+                    imgpath = img_norm
+                else:
+                    img_rel = img_norm.lstrip('\\/')
+                    imgpath = os.path.join(self.root, img_rel)
+            else:
+                imgpath = os.path.join(self.root, img_norm)
             if imgpath not in anns_by_img:
                 anns_by_img[imgpath] = {'boxes':[], 'labels':[]}
             anns_by_img[imgpath]['boxes'].append(box)
