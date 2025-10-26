@@ -133,6 +133,8 @@ class DetectionAugmentation:
         if self.enable_geometric and random.random() < self.geometric_prob:
             image, bboxes = self._apply_geometric(image, bboxes)
         
+        # Replace any NaN/inf produced by ops and ensure values are finite
+        image = np.nan_to_num(image, nan=0.0, posinf=255.0, neginf=0.0)
         # Clip and convert back to uint8
         image = np.clip(image, 0, 255).astype(np.uint8)
         
@@ -149,9 +151,18 @@ class DetectionAugmentation:
         mean = image.mean()
         image = (image - mean) * contrast + mean
         
-        # Gamma correction
-        gamma = random.uniform(*self.gamma_range)
-        image = np.power(image / 255.0, gamma) * 255.0
+        # Gamma correction (safe): ensure valid gamma and non-negative base
+        gamma = float(random.uniform(*self.gamma_range))
+        # Guard against invalid gamma values
+        if not np.isfinite(gamma) or gamma <= 0:
+            gamma = 1.0
+
+        # Work on a clipped, float-normalized image so negative values do not produce NaN
+        img_norm = np.clip(image, 0.0, 255.0) / 255.0
+        corrected = np.power(img_norm, gamma) * 255.0
+        # Replace any NaN/inf and write back
+        corrected = np.nan_to_num(corrected, nan=0.0, posinf=255.0, neginf=0.0)
+        image = corrected
         
         # Gaussian blur
         kernel_size = random.randint(*self.blur_kernel_range)

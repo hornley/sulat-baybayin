@@ -3,6 +3,7 @@ import os
 import time
 from datetime import datetime
 import torch
+import torch.distributed as dist
 import torchvision
 import torchvision.transforms as T
 import random
@@ -220,6 +221,7 @@ def main():
     parser.add_argument('--no-cuda', action='store_true', help='Disable CUDA even if available')
     parser.add_argument('--gpu-ids', type=str, default=None, help='Comma-separated list of GPU ids to use (e.g. "0,1"). If not set, all available GPUs will be used when CUDA enabled')
     parser.add_argument('--no-dp', action='store_true', help='Disable DataParallel wrapping even if multiple GPUs detected')
+    parser.add_argument('--ddp', action='store_true', help='Enable DistributedDataParallel (torchrun/torch.distributed). Recommended over DataParallel for multi-GPU')
     
     # === AUGMENTATION OPTIONS ===
     parser.add_argument('--aug-enable', action='store_true', help='Enable augmentation during training')
@@ -276,6 +278,9 @@ def main():
     parser.add_argument('--aug-geometric-prob', type=float, default=0.7, help='Probability of applying geometric transformations')
     
     args = parser.parse_args()
+
+    # Determine if we're running under torchrun / distributed
+    running_ddp = args.ddp or ('LOCAL_RANK' in os.environ)
 
     # === YAML CONFIG LOADING ===
     if args.args_input is not None:
@@ -343,10 +348,38 @@ def main():
     if args.early_stop_monitor == 'val_loss' and not args.val_ann:
         print('Warning: --early-stop-monitor val_loss selected but no --val-ann provided; val_loss will be None and early-stopping on val_loss will be disabled.', file=sys.stderr)
 
-    # Device selection: respect --no-cuda and allow selecting specific GPU ids
-    use_cuda = torch.cuda.is_available() and not args.no_cuda
-    device = 'cuda' if use_cuda else 'cpu'
     dl_kwargs = dataloader_kwargs_from_args(args)
+
+    # Device selection: handle DDP (per-process GPU assignment) or single-process mode
+    use_cuda = torch.cuda.is_available() and not args.no_cuda
+    if running_ddp:
+        # torchrun sets LOCAL_RANK; default to 0 if not present
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        # init process group (env:// works with torchrun)
+        try:
+            dist.init_process_group(backend='nccl', init_method='env://')
+        except Exception:
+            # fallback to gloo if nccl not available (e.g., CPU or Win)
+            try:
+                dist.init_process_group(backend='gloo', init_method='env://')
+            except Exception:
+                pass
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f'cuda:{local_rank}')
+        else:
+            device = torch.device('cpu')
+        # expose rank helpers
+        try:
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        except Exception:
+            rank = 0
+    else:
+        device = torch.device('cuda' if use_cuda else 'cpu')
+        local_rank = 0
+        rank = 0
 
     # Create augmentation pipeline if enabled
     augmentation = create_augmentation_from_args(args)
@@ -397,7 +430,12 @@ def main():
         # mixing strategies
         if args.mix_strategy == 'concat':
             # simple concatenation: synthetic then real; shuffle controlled by dataloader shuffle
-            train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
+            if running_ddp:
+                sampler = torch.utils.data.distributed.DistributedSampler(combined)
+                # DistributedSampler controls shuffling; disable DataLoader shuffle
+                train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn, **{k: v for k, v in dl_kwargs_local.items() if k != 'shuffle'})
+            else:
+                train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
             mix_log_path = os.path.join(args.out, 'mix_log_concat.csv')
         elif args.mix_strategy == 'alternating':
             # alternating batches: construct an index list where batches alternate between datasets
@@ -424,6 +462,9 @@ def main():
                         idxs.append(real_indices[ri]); ri += 1
                 toggle = not toggle
             from torch.utils.data import Subset
+            # alternating batching not supported under DDP without complex coordination
+            if running_ddp:
+                raise RuntimeError('DDP mode does not support mix_strategy=alternating. Use --mix-strategy concat or disable --ddp')
             train_loader = torch.utils.data.DataLoader(combined, batch_size=batch_size, sampler=torch.utils.data.sampler.SequentialSampler(idxs), collate_fn=collate_fn, **dl_kwargs_local)
             mix_log_path = os.path.join(args.out, 'mix_log_alternating.csv')
         else:
@@ -463,46 +504,68 @@ def main():
             random.shuffle(chosen)
             from torch.utils.data import Subset
             epoch_subset = Subset(combined, chosen)
+            if running_ddp:
+                raise RuntimeError('DDP mode does not support mix_strategy=quotas. Use --mix-strategy concat or disable --ddp')
             train_loader = torch.utils.data.DataLoader(epoch_subset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, **dl_kwargs_local)
             mix_log_path = os.path.join(args.out, 'mix_log_quotas.csv')
     else:
-        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
+        if running_ddp:
+            sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+            train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn, **{k: v for k, v in dl_kwargs_local.items() if k != 'shuffle'})
+        else:
+            train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, **dl_kwargs_local)
 
     classes = train_ds.classes
     model = get_model(len(classes) + 1)
     # Move model to primary device
     model.to(device)
 
-    # Multi-GPU: optionally wrap with DataParallel when multiple GPUs are requested/available
-    gpu_ids = None
-    if use_cuda:
-        try:
-            if args.gpu_ids:
-                gpu_ids = [int(x) for x in args.gpu_ids.split(',') if x.strip() != '']
-            else:
-                gpu_ids = list(range(torch.cuda.device_count()))
-        except Exception:
-            gpu_ids = None
-
-    # If multiple GPU ids available and DataParallel not disabled, wrap model
-    dp_wrapper = None
-    if device == 'cuda' and not args.no_dp and gpu_ids and len(gpu_ids) > 1:
-        try:
-            model = torch.nn.DataParallel(model, device_ids=gpu_ids)
-            dp_wrapper = True
-            print(f'Using DataParallel on GPUs: {gpu_ids}')
-        except Exception as e:
-            print('Could not enable DataParallel, continuing on single device:', e)
-            dp_wrapper = False
-
-    # optionally freeze backbone
+    # Optionally freeze backbone BEFORE wrapping (works for single-GPU and DDP)
     if args.freeze_backbone:
         try:
+            # model is not yet wrapped; freeze directly
             for p in model.backbone.parameters():
                 p.requires_grad = False
-            print('Backbone frozen: only head/RPN params will be trained')
+            if not running_ddp or (running_ddp and rank == 0):
+                print('Backbone frozen: only head/RPN params will be trained')
         except Exception:
-            print('Warning: could not freeze backbone (unexpected model structure)')
+            if not running_ddp or (running_ddp and rank == 0):
+                print('Warning: could not freeze backbone (unexpected model structure)')
+
+    # Multi-GPU: if running_ddp use DistributedDataParallel, else optional DataParallel
+    dp_wrapper = None
+    if running_ddp:
+        try:
+            # find_unused_parameters set to False for performance; set True only if your forward has conditional unused params
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank] if use_cuda else None, output_device=local_rank if use_cuda else None, find_unused_parameters=False)
+            dp_wrapper = 'ddp'
+            if rank == 0:
+                print(f'Using DistributedDataParallel on local_rank {local_rank} (world_size={world_size})')
+        except Exception as e:
+            if rank == 0:
+                print('Could not enable DistributedDataParallel, continuing on single device:', e)
+            dp_wrapper = False
+    else:
+        gpu_ids = None
+        if use_cuda:
+            try:
+                if args.gpu_ids:
+                    gpu_ids = [int(x) for x in args.gpu_ids.split(',') if x.strip() != '']
+                else:
+                    gpu_ids = list(range(torch.cuda.device_count()))
+            except Exception:
+                gpu_ids = None
+
+        if device.type == 'cuda' and not args.no_dp and gpu_ids and len(gpu_ids) > 1:
+            try:
+                model = torch.nn.DataParallel(model, device_ids=gpu_ids)
+                dp_wrapper = 'dp'
+                print(f'Using DataParallel on GPUs: {gpu_ids}')
+            except Exception as e:
+                print('Could not enable DataParallel, continuing on single device:', e)
+                dp_wrapper = False
+
+    # ...freeze handled before wrapping
 
     # build optimizer param groups (optional separate LR for backbone/head)
     backbone_ids = {id(p) for p in model.backbone.parameters()} if hasattr(model, 'backbone') else set()
@@ -541,8 +604,9 @@ def main():
             state = ck['model_state']
             # If model is DataParallel wrapped, strip/add 'module.' prefixes as needed
             try:
-                if isinstance(model, torch.nn.DataParallel):
-                    # checkpoint might be saved from single-gpu or dp; ensure keys have 'module.' prefix
+                # Handle DDP/DP wrapped models similarly
+                if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+                    # checkpoint might be saved from single-gpu or dp/ddp; ensure keys have 'module.' prefix
                     new_state = {}
                     for k, v in state.items():
                         if not k.startswith('module.'):
@@ -614,6 +678,12 @@ def main():
             # best-effort: do not crash training due to augmentation toggling
             pass
         avg_total, avg_cls, avg_box, matched, total_gt, elapsed = train_one_epoch(model, optimizer, train_loader, device, epoch, scaler=scaler, skip_batch_eval=args.no_batch_eval)
+        # If running distributed, step the sampler epoch for shuffling
+        if running_ddp and hasattr(train_loader, 'sampler') and isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+            try:
+                train_loader.sampler.set_epoch(epoch)
+            except Exception:
+                pass
         # if using quotas strategy we recorded a subset; compute how many samples from each source were used
         if args.real_data and args.real_ann and args.mix_strategy in ('alternating', 'quotas'):
             # count how many samples in the current train_loader came from real vs synth by inspecting dataset indices if available
@@ -635,12 +705,21 @@ def main():
         acc = matched / total_gt if total_gt else 0.0
         # print baseline epoch training summary; validation printed below if present
         epoch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} time={elapsed:.1f}s [{epoch_time}]')
+        if not running_ddp or (running_ddp and dist.get_rank() == 0):
+            print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} time={elapsed:.1f}s [{epoch_time}]')
 
         # optional validation when val_ann provided
         val_loss = None
         if args.val_ann:
-            val_ds = BBoxDataset(args.data, ann_file=args.val_ann, transforms=default_transforms, augmentation=None)  # No augmentation for validation
+            # Run validation only on rank 0 in DDP to avoid duplicate work
+            do_val = True
+            if running_ddp:
+                try:
+                    do_val = (dist.get_rank() == 0)
+                except Exception:
+                    do_val = True
+            if do_val:
+                val_ds = BBoxDataset(args.data, ann_file=args.val_ann, transforms=default_transforms, augmentation=None)  # No augmentation for validation
             v_dl_kwargs = dict(batch_size=batch_size, shuffle=False, collate_fn=collate_fn, **{k: v for k, v in dl_kwargs_local.items() if k != 'shuffle'})
             val_loader = torch.utils.data.DataLoader(val_ds, **v_dl_kwargs)
             model.eval()
@@ -659,7 +738,8 @@ def main():
                 print(f'Validation: val_loss={val_loss:.4f}')
         # if validation was run, include val_loss in a combined summary line
         if val_loss is not None:
-            print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} val_loss={val_loss:.4f} time={elapsed:.1f}s [{epoch_time}]')
+            if not running_ddp or (running_ddp and dist.get_rank() == 0):
+                print(f'Epoch {epoch+1}/{args.epochs}: train_loss={avg_total:.4f} cls_loss={avg_cls:.4f} box_loss={avg_box:.4f} acc={acc:.4f} val_loss={val_loss:.4f} time={elapsed:.1f}s [{epoch_time}]')
             model.train()
 
         # determine monitored metric for early stopping
@@ -670,6 +750,26 @@ def main():
             monitored = avg_total
         elif args.early_stop_monitor == 'acc':
             monitored = acc
+
+        # If running distributed, compute a synchronized/global monitored metric so
+        # early-stopping decisions are consistent across ranks. We use an all-reduce
+        # to average the per-process monitored value. If monitored is None (e.g., no
+        # val set when monitoring val_loss) we keep it None.
+        monitored_for_decision = monitored
+        if running_ddp and monitored is not None:
+            try:
+                # use a tensor on the device for all_reduce
+                m_tensor = torch.tensor(float(monitored), device=device)
+                dist.all_reduce(m_tensor, op=dist.ReduceOp.SUM)
+                world = dist.get_world_size()
+                m_avg = (m_tensor.item() / float(world))
+                monitored_for_decision = m_avg
+                # show rank 0 the synchronized value in logs (other ranks will be quieter)
+                if not running_ddp or (running_ddp and dist.get_rank() == 0):
+                    print(f'Synchronized monitored ({args.early_stop_monitor}) = {monitored_for_decision:.6f} (avg across {world} ranks)')
+            except Exception:
+                # if anything goes wrong, fall back to local monitored
+                monitored_for_decision = monitored
 
         # early stopping bookkeeping
         if epoch == start_epoch:
@@ -699,19 +799,24 @@ def main():
                 best_epoch = epoch
                 epochs_no_improve = 0
                 # save best-seen checkpoint (keeps best observed by the monitored metric during training)
-                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'best_seen.pth'))
-                print(f'New best {args.early_stop_monitor}={best_monitored:.4f} at epoch {epoch+1}, saved best_seen.pth')
-            else:
-                epochs_no_improve += 1
-                print(f'No improvement in {args.early_stop_monitor} for {epochs_no_improve} epochs (best: {best_monitored})')
+                # Only save on rank 0 when distributed
+                if not running_ddp or (running_ddp and dist.get_rank() == 0):
+                    save_checkpoint({'epoch': epoch, 'model_state': (model.module.state_dict() if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.state_dict()), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'best_seen.pth'))
+                    print(f'New best {args.early_stop_monitor}={best_monitored:.4f} at epoch {epoch+1}, saved best_seen.pth')
+                else:
+                    epochs_no_improve += 1
+                    if not running_ddp or (running_ddp and dist.get_rank() == 0):
+                        print(f'No improvement in {args.early_stop_monitor} for {epochs_no_improve} epochs (best: {best_monitored})')
 
             if epochs_no_improve >= args.early_stop_patience and args.early_stop_patience > 0:
                 print(f'Early stopping: no improvement in {args.early_stop_monitor} for {epochs_no_improve} epochs (patience={args.early_stop_patience})')
                 # save final checkpoint
-                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'final_epoch_{epoch}.pth'))
+                if not running_ddp or (running_ddp and dist.get_rank() == 0):
+                    save_checkpoint({'epoch': epoch, 'model_state': (model.module.state_dict() if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.state_dict()), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, f'final_epoch_{epoch}.pth'))
                 # also save an explicit early-stop checkpoint
-                save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'early_stop.pth'))
-                print(f'Saved early-stop checkpoint to early_stop.pth')
+                if not running_ddp or (running_ddp and dist.get_rank() == 0):
+                    save_checkpoint({'epoch': epoch, 'model_state': (model.module.state_dict() if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.state_dict()), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'early_stop.pth'))
+                    print(f'Saved early-stop checkpoint to early_stop.pth')
                 break
 
         # scheduler step
@@ -723,8 +828,9 @@ def main():
 
         # Save last.pth each epoch when requested (overwrite)
         if args.save_last:
-            save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'last.pth'))
-            print(f'Saved last.pth (epoch {epoch+1})')
+            if not running_ddp or (running_ddp and dist.get_rank() == 0):
+                save_checkpoint({'epoch': epoch, 'model_state': (model.module.state_dict() if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.state_dict()), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'last.pth'))
+                print(f'Saved last.pth (epoch {epoch+1})')
             
             # Backup to Google Drive after each epoch if specified
             # Only perform GDrive backup when explicitly running in Colab mode (and not Kaggle).
@@ -742,10 +848,12 @@ def main():
 
     # At training end (normal completion or early stop), write final checkpoint to best.pth
     try:
-        save_checkpoint({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'best.pth'))
-        print('Saved final checkpoint to best.pth')
+        if not running_ddp or (running_ddp and dist.get_rank() == 0):
+            save_checkpoint({'epoch': epoch, 'model_state': (model.module.state_dict() if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.state_dict()), 'optimizer_state': optimizer.state_dict(), 'classes': classes}, os.path.join(args.out, 'best.pth'))
+            print('Saved final checkpoint to best.pth')
     except Exception:
-        print('Warning: could not write final best.pth')
+        if rank == 0:
+            print('Warning: could not write final best.pth')
 
     # Final backup to Google Drive: only perform when --colab is set and not --kaggle
     if args.gdrive_backup and getattr(args, 'colab', False) and not getattr(args, 'kaggle', False):
@@ -777,6 +885,13 @@ def main():
             print('Wrote mix log to', mix_log_path)
     except Exception:
         pass
+
+    # Cleanup distributed process group
+    if running_ddp:
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
