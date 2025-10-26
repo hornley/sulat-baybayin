@@ -216,6 +216,10 @@ def main():
     # Convenience flags for hosted runtimes
     parser.add_argument('--colab', action='store_true', help='Enable Colab-specific defaults (attempt to mount Google Drive and set sensible paths)')
     parser.add_argument('--kaggle', action='store_true', help='Enable Kaggle-specific defaults (write outputs to /kaggle/working and reduce workers)')
+    # Multi-GPU / CUDA options
+    parser.add_argument('--no-cuda', action='store_true', help='Disable CUDA even if available')
+    parser.add_argument('--gpu-ids', type=str, default=None, help='Comma-separated list of GPU ids to use (e.g. "0,1"). If not set, all available GPUs will be used when CUDA enabled')
+    parser.add_argument('--no-dp', action='store_true', help='Disable DataParallel wrapping even if multiple GPUs detected')
     
     # === AUGMENTATION OPTIONS ===
     parser.add_argument('--aug-enable', action='store_true', help='Enable augmentation during training')
@@ -339,7 +343,9 @@ def main():
     if args.early_stop_monitor == 'val_loss' and not args.val_ann:
         print('Warning: --early-stop-monitor val_loss selected but no --val-ann provided; val_loss will be None and early-stopping on val_loss will be disabled.', file=sys.stderr)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Device selection: respect --no-cuda and allow selecting specific GPU ids
+    use_cuda = torch.cuda.is_available() and not args.no_cuda
+    device = 'cuda' if use_cuda else 'cpu'
     dl_kwargs = dataloader_kwargs_from_args(args)
 
     # Create augmentation pipeline if enabled
@@ -464,7 +470,30 @@ def main():
 
     classes = train_ds.classes
     model = get_model(len(classes) + 1)
+    # Move model to primary device
     model.to(device)
+
+    # Multi-GPU: optionally wrap with DataParallel when multiple GPUs are requested/available
+    gpu_ids = None
+    if use_cuda:
+        try:
+            if args.gpu_ids:
+                gpu_ids = [int(x) for x in args.gpu_ids.split(',') if x.strip() != '']
+            else:
+                gpu_ids = list(range(torch.cuda.device_count()))
+        except Exception:
+            gpu_ids = None
+
+    # If multiple GPU ids available and DataParallel not disabled, wrap model
+    dp_wrapper = None
+    if device == 'cuda' and not args.no_dp and gpu_ids and len(gpu_ids) > 1:
+        try:
+            model = torch.nn.DataParallel(model, device_ids=gpu_ids)
+            dp_wrapper = True
+            print(f'Using DataParallel on GPUs: {gpu_ids}')
+        except Exception as e:
+            print('Could not enable DataParallel, continuing on single device:', e)
+            dp_wrapper = False
 
     # optionally freeze backbone
     if args.freeze_backbone:
@@ -509,7 +538,35 @@ def main():
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location=device)
         if 'model_state' in ck:
-            model.load_state_dict(ck['model_state'])
+            state = ck['model_state']
+            # If model is DataParallel wrapped, strip/add 'module.' prefixes as needed
+            try:
+                if isinstance(model, torch.nn.DataParallel):
+                    # checkpoint might be saved from single-gpu or dp; ensure keys have 'module.' prefix
+                    new_state = {}
+                    for k, v in state.items():
+                        if not k.startswith('module.'):
+                            new_state['module.' + k] = v
+                        else:
+                            new_state[k] = v
+                    model.load_state_dict(new_state)
+                else:
+                    # model is single-GPU/CPU; strip 'module.' if present
+                    new_state = {}
+                    for k, v in state.items():
+                        if k.startswith('module.'):
+                            new_state[k[len('module.'):]] = v
+                        else:
+                            new_state[k] = v
+                    model.load_state_dict(new_state)
+                print('Loaded model state from', args.resume)
+            except Exception:
+                # Last resort: attempt to load with strict=False
+                try:
+                    model.load_state_dict(state, strict=False)
+                    print('Loaded model state with strict=False from', args.resume)
+                except Exception:
+                    print('Failed to load model state from', args.resume)
             print('Loaded model state from', args.resume)
         if args.resume_optimizer and 'optimizer_state' in ck:
             try:

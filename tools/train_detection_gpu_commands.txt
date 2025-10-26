@@ -1,0 +1,13 @@
+# Modified training commands with --gpu-ids 0,1 and updated batch/workers
+
+# Stage 1
+python train_detection.py --data sentences_data_synth/base_synth_data --ann annotations/base_annotations_noheader.csv --epochs 15 --batch 8 --num-workers 2 --pin-memory --amp --freeze-backbone --lr 0.002 --lr-head 0.008 --momentum 0.95 --weight-decay 0.001 --no-batch-eval --early-stop-monitor train_loss --early-stop-min-delta 0.0005 --early-stop-patience 5 --out checkpoints/detection/kaggle_run12/stage1 --save-last
+
+# Stage 2
+python train_detection.py --data sentences_data_synth/textured_synth_data --ann annotations/textured_annotations_noheader.csv --resume checkpoints/detection/kaggle_run12/stage1/best.pth --epochs 30 --batch 8 --num-workers 2 --pin-memory --amp --lr 1e-4 --lr-backbone 2e-5 --lr-head 5e-5 --momentum 0.95 --weight-decay 0.001 --no-batch-eval --early-stop-monitor train_loss --early-stop-min-delta 0.0002 --early-stop-patience 8 --out checkpoints/detection/kaggle_run12/stage2 --save-last
+
+## Stage 3
+python train_detection.py --data sentences_data_synth/base_synth_data --ann annotations/annotations_noheader.csv --resume checkpoints/detection/kaggle_run12/stage2/best.pth --epochs 20 --batch 8 --num-workers 2 --pin-memory --amp --aug-enable --lr 3e-5 --lr-backbone 5e-6 --lr-head 1e-5 --momentum 0.95 --weight-decay 0.001 --no-batch-eval --early-stop-monitor train_loss --early-stop-min-delta 0.0001 --early-stop-patience 10 --out checkpoints/detection/kaggle_run12/stage3 --save-last
+
+## Stage 4
+python train_detection.py --data sentences_data_synth/textured_synth_data --ann annotations/textured_annotations_noheader.csv --resume checkpoints/detection/kaggle_run12/stage3/best.pth --epochs 20 --batch 8 --num-workers 2 --pin-memory --amp --aug-enable --lr 1e-5 --lr-backbone 2e-6 --lr-head 5e-6 --momentum 0.95 --weight-decay 0.001 --no-batch-eval --early-stop-monitor train_loss --early-stop-min-delta 0.00008 --early-stop-patience 8 --out checkpoints/detection/kaggle_run12/stage4 --save-last
