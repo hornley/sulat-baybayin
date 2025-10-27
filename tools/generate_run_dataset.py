@@ -65,6 +65,10 @@ def run_generation(name, count, paper_type, paper_texture, extra_args=""):
     print(f"{'='*70}")
     
     try:
+        # Ensure all command parts are strings (avoid ints leaking in)
+        base_cmd = [str(x) for x in base_cmd]
+        # Prefer explicit Python executable for reproducibility
+        base_cmd[0] = sys.executable if base_cmd and base_cmd[0] in ('python', 'python3') else base_cmd[0]
         result = subprocess.run(base_cmd, check=True, capture_output=True, text=True)
         
         # Get annotation count after

@@ -644,6 +644,12 @@ def main():
                 print('Could not load optimizer state (optimizer/model mismatch)')
         if 'epoch' in ck:
             start_epoch = ck['epoch'] + 1
+            # Inform user which epoch we are resuming from (only print on rank 0 in DDP)
+            try:
+                if not running_ddp or (running_ddp and rank == 0):
+                    print(f'Resuming from checkpoint {args.resume}: last saved epoch={ck.get("epoch")}, starting at epoch={start_epoch}')
+            except Exception:
+                print(f'Resuming from checkpoint {args.resume}: starting at epoch={start_epoch}')
 
     os.makedirs(args.out, exist_ok=True)
 
