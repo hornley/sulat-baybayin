@@ -167,6 +167,8 @@ def main(argv=None):
     p.add_argument('--out-dir', default='sentences_data_synth', help='Output directory for generated images')
     p.add_argument('--ann', default=None, help='Path to annotation CSV (omit to skip writing annotations)')
     p.add_argument('--append', action='store_true', help='Continue numbering from highest existing image in --out-dir instead of starting at 0')
+    p.add_argument('--fill-gaps', action='store_true', help='When used with --append, reuse missing image indices (fill holes) before appending at the end')
+    p.add_argument('--target-total', type=int, default=None, help='If used with --append, treat the provided number as the desired total images in --out-dir; will generate up to this total (fill gaps then append as needed)')
     p.add_argument('--min_symbols', type=int, default=3, help='Minimum symbols per sentence')
     p.add_argument('--max_symbols', type=int, default=8, help='Maximum symbols per sentence')
     
@@ -346,28 +348,90 @@ def main(argv=None):
         except Exception as e:
             print(f'Warning: failed to parse --paper-type-mix: {e}; ignoring')
 
-    # determine starting index for image numbering
-    start_idx = 0
+    # determine which image indices we'll generate into
+    # We support three modes:
+    #  - default: generate args.count images into indices 0..count-1
+    #  - --append: generate args.count images starting at max_idx+1 (unless --fill-gaps used)
+    #  - --append + --target-total: generate only enough images to reach target total (fills gaps first)
+    gen_count = int(args.count)
+    indices_to_use = list(range(0, gen_count))
+
     if args.append:
         try:
             existing = [f for f in os.listdir(IMG_DIR) if f.startswith('img_') and f.endswith('.png')]
-            if existing:
-                indices = []
-                for fname in existing:
+            indices = []
+            for fname in existing:
+                try:
+                    num_part = fname.replace('img_', '').replace('.png', '')
+                    indices.append(int(num_part))
+                except Exception:
+                    pass
+
+            if indices:
+                max_idx = max(indices)
+                existing_count = len(set(indices))
+                # If user asked for a target total, compute how many images we actually need to generate
+                if args.target_total is not None:
                     try:
-                        num_part = fname.replace('img_', '').replace('.png', '')
-                        indices.append(int(num_part))
+                        target = int(args.target_total)
+                        need = max(0, target - existing_count)
                     except Exception:
-                        pass
-                if indices:
-                    start_idx = max(indices) + 1
+                        need = gen_count
+                    if need == 0:
+                        print(f'Output already has {existing_count} images (>= target {args.target_total}); nothing to generate.')
+                        return
+                    gen_count = need
+                # if user requested filling gaps, compute missing indices between 0..max_idx
+                if args.fill_gaps:
+                    existing_set = set(indices)
+                    # Build missing indices by scanning the gaps between existing sorted indices (efficient)
+                    missing = []
+                    # Walk sorted unique existing indices to find gaps
+                    sorted_idx = sorted(existing_set)
+                    prev = -1
+                    for s in sorted_idx:
+                        if s - prev > 1:
+                            # add range(prev+1 .. s-1)
+                            for m in range(prev + 1, s):
+                                missing.append(m)
+                                if len(missing) >= gen_count:
+                                    break
+                        prev = s
+                        if len(missing) >= gen_count:
+                            break
+                    # If still need more and there are indices below max_idx not captured (unlikely), fill from tail
+                    if len(missing) < gen_count and max_idx > sorted_idx[-1]:
+                        for m in range(sorted_idx[-1] + 1, max_idx):
+                            if m not in existing_set:
+                                missing.append(m)
+                                if len(missing) >= gen_count:
+                                    break
+
+                    take_missing = missing[:gen_count]
+                    remaining = gen_count - len(take_missing)
+                    if remaining > 0:
+                        append_range = list(range(max_idx + 1, max_idx + 1 + remaining))
+                    else:
+                        append_range = []
+                    indices_to_use = take_missing + append_range
+                    print(f'Append+fill-gaps: filling {len(take_missing)} holes and then appending {len(append_range)} new images starting at img_{(max_idx+1):05d}.png')
+                else:
+                    # standard append: start at max_idx + 1
+                    start_idx = max_idx + 1
+                    indices_to_use = list(range(start_idx, start_idx + gen_count))
                     print(f'Appending: starting from img_{start_idx:05d}.png')
         except Exception as e:
-            print(f'Warning: could not determine existing images for --append: {e}; starting from 0')
+            print(f'Warning: could not determine existing images for --append: {e}; defaulting to starting at 0')
+
+    # If no indices to use (e.g., target reached), exit early
+    if not indices_to_use:
+        print('No images to generate (indices_to_use empty).')
+        return
 
     rows = []
     # track if any thin strokes were detected in this image to avoid post-composition blur
-    for i in range(start_idx, start_idx + args.count):
+    # iterate using the precomputed indices_to_use so annotations and filenames align
+    for i in indices_to_use:
         # randomly choose paper type if mix is specified
         if paper_type_probs:
             current_paper_type = random.choices(paper_type_choices, weights=paper_type_probs)[0]
@@ -743,6 +807,8 @@ def main(argv=None):
         # crop to used width
         used_w = min(w_canvas, x + 8)
         art_cropped = art.crop((0,0,used_w,h_canvas))
+        # target filename for this image index (ensure defined for all code paths)
+        fname = os.path.join(IMG_DIR, f'img_{i:05d}.png')
     # apply mild global jitter: contrast, brightness, and tiny blur to blend composition
         try:
             # contrast and brightness jitter (narrower ranges to avoid washing out or over-darkening)
@@ -769,7 +835,6 @@ def main(argv=None):
                 art_cropped = art_cropped.filter(ImageFilter.GaussianBlur(radius=blur_r))
         except Exception:
             art_cropped = art_cropped.convert('RGBA')
-        fname = os.path.join(IMG_DIR, f'img_{i:05d}.png')
         # optionally apply paper/background texture and lighting
         # ensure `final` has a sensible default in case augmentation fails
         final = art_cropped.convert('RGB')
@@ -877,7 +942,7 @@ def main(argv=None):
                 w.writerow(r)
         print('Wrote annotations to', ann_path)
 
-    print('Wrote', args.count, 'synthetic images to', IMG_DIR)
+    print('Wrote', len(rows), 'synthetic images to', IMG_DIR)
 
 
 if __name__ == '__main__':
