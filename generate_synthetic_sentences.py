@@ -219,6 +219,7 @@ def main(argv=None):
     p.add_argument('--line-thickness', type=int, default=1, help='Line thickness in pixels (applies to all paper types)')
     p.add_argument('--line-jitter', type=int, default=2, help='Vertical jitter per line in pixels (applies to all paper types)')
     p.add_argument('--line-color', type=str, default='0,0,0', help='RGB color for lines as comma-separated ints, e.g. 0,0,0 (yellow-paper defaults to blue if black specified)')
+    p.add_argument('--preserve-line-color', action='store_true', help='Do not substitute a blue default for black when paper_type is yellow-paper; preserve exact --line-color')
     
     # === DOTTED PAPER ===
     p.add_argument('--dot-size', type=int, default=1, help='Radius for dotted paper dots')
@@ -868,6 +869,7 @@ def main(argv=None):
                     dot_opacity_override=int(args.dot_opacity),
                     dot_uniform=use_dot_uniform,
                     dot_spacing=int(args.dot_spacing)
+                    , preserve_line_color=bool(args.preserve_line_color)
             )
             # optionally overlay ruled-paper lines independently (honor --paper-lines-prob)
             # note: yellow-paper always draws its ruled lines (ignoring --paper-lines-prob) but uses the line properties

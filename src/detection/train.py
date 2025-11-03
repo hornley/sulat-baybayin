@@ -85,6 +85,139 @@ def get_model(num_classes):
     return model
 
 
+def iou_matrix(a, b):
+    """Compute IoU matrix between two sets of boxes.
+
+    Args:
+        a: Tensor[N,4]
+        b: Tensor[M,4]
+    Returns:
+        Tensor[N,M] of IoU values.
+    """
+    if a.numel() == 0 or b.numel() == 0:
+        return torch.zeros((a.shape[0], b.shape[0]), device=a.device)
+    lt = torch.max(a[:, None, :2], b[None, :, :2])
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / union.clamp(min=1e-6)
+
+
+def compute_map(model, data_loader, classes, device='cpu', iou_thresh=0.5, score_thresh=0.05):
+    """Compute a simple per-class AP (at a single IoU threshold) and return mean AP.
+
+    This implementation uses the classic AP computation by sorting detections by
+    score and marking a detection as true positive if it matches an unmatched
+    ground-truth box of the same class in the same image with IoU >= iou_thresh.
+
+    Returns:
+        dict with keys: 'per_class_ap' (dict class->AP), 'map' (float mean AP)
+    """
+    model.eval()
+    device = device
+    # collect ground-truths and predictions
+    gt_by_image = {}  # image_id -> list of (label, box)
+    preds_by_class = {c: [] for c in classes}
+    # total gt counts per class
+    gt_counts = {c: 0 for c in classes}
+
+    with torch.no_grad():
+        for imgs, targets in data_loader:
+            imgs_t = [img.to(device) for img in imgs]
+            outputs = model(imgs_t)
+            for out, tgt in zip(outputs, targets):
+                image_id = tgt.get('image_id', None) or ''
+                gt_boxes = tgt.get('boxes', torch.zeros((0, 4))).to(device)
+                gt_labels = tgt.get('labels', torch.zeros((0,), dtype=torch.int64)).to(device)
+                gt_entries = []
+                for gb, gl in zip(gt_boxes.cpu().tolist(), gt_labels.cpu().tolist()):
+                    lbl = classes[int(gl) - 1] if int(gl) > 0 and int(gl)-1 < len(classes) else str(int(gl))
+                    gt_entries.append({'label': lbl, 'box': torch.tensor(gb)})
+                    if lbl in gt_counts:
+                        gt_counts[lbl] += 1
+                gt_by_image[image_id] = gt_entries
+
+                pred_boxes = out.get('boxes', torch.zeros((0, 4))).to(device)
+                pred_labels = out.get('labels', torch.zeros((0,), dtype=torch.int64)).to(device)
+                pred_scores = out.get('scores', torch.zeros((0,))).to(device)
+
+                # filter by score threshold
+                keep = pred_scores >= score_thresh
+                pred_boxes = pred_boxes[keep]
+                pred_labels = pred_labels[keep]
+                pred_scores = pred_scores[keep]
+
+                for pb, pl, ps in zip(pred_boxes.cpu().tolist(), pred_labels.cpu().tolist(), pred_scores.cpu().tolist()):
+                    lbl = classes[int(pl) - 1] if int(pl) > 0 and int(pl)-1 < len(classes) else str(int(pl))
+                    if lbl not in preds_by_class:
+                        preds_by_class[lbl] = []
+                    preds_by_class[lbl].append({'image_id': image_id, 'score': float(ps), 'box': torch.tensor(pb)})
+
+    per_class_ap = {}
+    for c in classes:
+        preds = preds_by_class.get(c, [])
+        npos = gt_counts.get(c, 0)
+        if npos == 0:
+            # no ground-truths for this class; skip from MAP (consistent with many mAP implementations)
+            continue
+        # sort preds by score desc
+        preds_sorted = sorted(preds, key=lambda x: x['score'], reverse=True)
+        tp = []
+        fp = []
+        # track which gt boxes have been matched per image for this class
+        matched_gts = {}
+        for p in preds_sorted:
+            img_id = p['image_id']
+            pbox = p['box'].to(device).float()
+            matched = False
+            gts = [g for g in gt_by_image.get(img_id, []) if g['label'] == c]
+            if len(gts) == 0:
+                fp.append(1)
+                tp.append(0)
+                continue
+            # build tensors
+            gt_boxes_tensor = torch.stack([g['box'].float() for g in gts]).to(device)
+            if img_id not in matched_gts:
+                matched_gts[img_id] = [False] * gt_boxes_tensor.shape[0]
+            ious = iou_matrix(gt_boxes_tensor, pbox.unsqueeze(0)).squeeze(1)  # [G]
+            best_iou, best_idx = torch.max(ious, dim=0)
+            if best_iou.item() >= iou_thresh and not matched_gts[img_id][int(best_idx.item())]:
+                tp.append(1)
+                fp.append(0)
+                matched_gts[img_id][int(best_idx.item())] = True
+            else:
+                tp.append(0)
+                fp.append(1)
+
+        if len(tp) == 0:
+            per_class_ap[c] = 0.0
+            continue
+        tp_c = torch.tensor(tp, dtype=torch.float32)
+        fp_c = torch.tensor(fp, dtype=torch.float32)
+        cum_tp = torch.cumsum(tp_c, dim=0)
+        cum_fp = torch.cumsum(fp_c, dim=0)
+        precisions = cum_tp / (cum_tp + cum_fp + 1e-8)
+        recalls = cum_tp / float(npos)
+
+        # compute AP as area under precision-recall curve using step integration
+        ap = 0.0
+        prev_recall = 0.0
+        for p_val, r_val in zip(precisions.tolist(), recalls.tolist()):
+            ap += p_val * (r_val - prev_recall)
+            prev_recall = r_val
+        per_class_ap[c] = float(ap)
+
+    # mean AP over classes that had at least one GT
+    if len(per_class_ap) == 0:
+        m_ap = 0.0
+    else:
+        m_ap = sum(per_class_ap.values()) / len(per_class_ap)
+    return {'per_class_ap': per_class_ap, 'map': m_ap}
+
+
 def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10, scaler=None, skip_batch_eval=False):
     model.train()
     # accumulators
@@ -145,19 +278,6 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10,
                     labels = labels[keep]
                     if boxes.shape[0] == 0:
                         continue
-                    def iou_matrix(a, b):
-                        A = a.shape[0]
-                        B = b.shape[0]
-                        if A == 0 or B == 0:
-                            return torch.zeros((A,B), device=a.device)
-                        lt = torch.max(a[:, None, :2], b[None, :, :2])
-                        rb = torch.min(a[:, None, 2:], b[None, :, 2:])
-                        wh = (rb - lt).clamp(min=0)
-                        inter = wh[:,:,0] * wh[:,:,1]
-                        area_a = (a[:,2]-a[:,0]).clamp(min=0) * (a[:,3]-a[:,1]).clamp(min=0)
-                        area_b = (b[:,2]-b[:,0]).clamp(min=0) * (b[:,3]-b[:,1]).clamp(min=0)
-                        union = area_a[:,None] + area_b[None,:] - inter
-                        return inter / union.clamp(min=1e-6)
                     ious = iou_matrix(gt_boxes, boxes)
                     for gi in range(gt_boxes.shape[0]):
                         same_label = (labels == gt_labels[gi])
@@ -211,7 +331,7 @@ def main():
     # early stopping options
     parser.add_argument('--early-stop-patience', type=int, default=0, help='Number of epochs with no improvement after which training will be stopped (0 disables)')
     parser.add_argument('--early-stop-min-delta', type=float, default=0.0, help='Minimum change in monitored metric to qualify as improvement')
-    parser.add_argument('--early-stop-monitor', choices=['val_loss', 'train_loss', 'acc'], default='val_loss', help='Metric to monitor for early stopping')
+    parser.add_argument('--early-stop-monitor', choices=['val_loss', 'train_loss', 'acc', 'val_map'], default='val_loss', help='Metric to monitor for early stopping')
     # google drive backup option
     parser.add_argument('--gdrive-backup', default=None, help='Google Drive path to backup checkpoints (e.g., /content/drive/MyDrive/SulatBaybayin/)')
     # Convenience flags for hosted runtimes
@@ -710,6 +830,7 @@ def main():
 
         # optional validation when val_ann provided
         val_loss = None
+        val_map = None
         if args.val_ann:
             # Run validation only on rank 0 in DDP to avoid duplicate work
             do_val = True
@@ -720,22 +841,43 @@ def main():
                     do_val = True
             if do_val:
                 val_ds = BBoxDataset(args.data, ann_file=args.val_ann, transforms=default_transforms, augmentation=None)  # No augmentation for validation
-            v_dl_kwargs = dict(batch_size=batch_size, shuffle=False, collate_fn=collate_fn, **{k: v for k, v in dl_kwargs_local.items() if k != 'shuffle'})
-            val_loader = torch.utils.data.DataLoader(val_ds, **v_dl_kwargs)
-            model.eval()
-            total_val = 0.0
-            n_val = 0
-            with torch.no_grad():
-                for imgs, targets in val_loader:
-                    imgs = list(img.to(device) for img in imgs)
-                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                    loss_dict = model(imgs, targets)
-                    losses = sum(loss for loss in loss_dict.values())
-                    total_val += float(losses.item())
-                    n_val += 1
-            if n_val:
-                val_loss = total_val / n_val
-                print(f'Validation: val_loss={val_loss:.4f}')
+                v_dl_kwargs = dict(batch_size=batch_size, shuffle=False, collate_fn=collate_fn, **{k: v for k, v in dl_kwargs_local.items() if k != 'shuffle'})
+                # Only the designated validation rank constructs and iterates the validation loader.
+                val_loss = None
+                val_map = None
+                if do_val:
+                    val_loader = torch.utils.data.DataLoader(val_ds, **v_dl_kwargs)
+                    model.eval()
+                    total_val = 0.0
+                    n_val = 0
+                    with torch.no_grad():
+                        for imgs, targets in val_loader:
+                            imgs = list(img.to(device) for img in imgs)
+                            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                            loss_dict = model(imgs, targets)
+                            losses = sum(loss for loss in loss_dict.values())
+                            total_val += float(losses.item())
+                            n_val += 1
+                    if n_val:
+                        val_loss = total_val / n_val
+                        print(f'Validation: val_loss={val_loss:.4f}')
+
+                    # If user requested val_map as the early-stop monitor, compute mAP on validation set
+                    if args.early_stop_monitor == 'val_map':
+                        try:
+                            # compute mAP at IoU=0.5 (Pascal-style mAP); this may be slow
+                            print('Computing validation mAP (this may take a while)...')
+                            map_result = compute_map(model, val_loader, classes, device=device, iou_thresh=0.5, score_thresh=0.05)
+                            val_map = map_result.get('map', 0.0)
+                            print(f'Validation: val_map={val_map:.6f}')
+                        except Exception as e:
+                            print('Warning: failed to compute val_map:', e)
+                            val_map = None
+                else:
+                    # Non-validation ranks should leave val_loss/val_map as None; they will
+                    # participate in the broadcast/all-reduce later so values are synchronized.
+                    val_loss = None
+                    val_map = None
         # if validation was run, include val_loss in a combined summary line
         if val_loss is not None:
             if not running_ddp or (running_ddp and dist.get_rank() == 0):
@@ -750,25 +892,42 @@ def main():
             monitored = avg_total
         elif args.early_stop_monitor == 'acc':
             monitored = acc
+        elif args.early_stop_monitor == 'val_map':
+            monitored = val_map if val_map is not None else None
 
-        # If running distributed, compute a synchronized/global monitored metric so
-        # early-stopping decisions are consistent across ranks. We use an all-reduce
-        # to average the per-process monitored value. If monitored is None (e.g., no
-        # val set when monitoring val_loss) we keep it None.
+        # If running distributed, ensure the monitored metric is available on all
+        # ranks in a way that avoids deadlocks. Metrics that are only computed on
+        # rank 0 (validation metrics like val_loss or val_map) are broadcast from
+        # rank 0 to all ranks. Metrics computed locally on every rank (train_loss,
+        # acc) are averaged across ranks via all_reduce.
         monitored_for_decision = monitored
-        if running_ddp and monitored is not None:
+        if running_ddp:
             try:
-                # use a tensor on the device for all_reduce
-                m_tensor = torch.tensor(float(monitored), device=device)
-                dist.all_reduce(m_tensor, op=dist.ReduceOp.SUM)
                 world = dist.get_world_size()
-                m_avg = (m_tensor.item() / float(world))
-                monitored_for_decision = m_avg
-                # show rank 0 the synchronized value in logs (other ranks will be quieter)
-                if not running_ddp or (running_ddp and dist.get_rank() == 0):
-                    print(f'Synchronized monitored ({args.early_stop_monitor}) = {monitored_for_decision:.6f} (avg across {world} ranks)')
+                r = dist.get_rank()
+                if args.early_stop_monitor in ('val_map', 'val_loss'):
+                    # rank 0 computes the metric (if available); other ranks create
+                    # a placeholder tensor and participate in the broadcast so there
+                    # are no mismatched collectives.
+                    local_val = float(monitored) if (r == 0 and monitored is not None) else 0.0
+                    m_tensor = torch.tensor(local_val, device=device)
+                    # Broadcast rank-0 value (or 0.0 if rank-0 failed to compute) to all ranks
+                    dist.broadcast(m_tensor, src=0)
+                    monitored_for_decision = float(m_tensor.item())
+                    if r == 0:
+                        print(f'Synchronized monitored ({args.early_stop_monitor}) = {monitored_for_decision:.6f} (broadcast from rank 0)')
+                else:
+                    # Per-process metrics (train_loss, acc) should be averaged across ranks
+                    # so each process sees the same global value.
+                    local_val = float(monitored) if monitored is not None else 0.0
+                    m_tensor = torch.tensor(local_val, device=device)
+                    dist.all_reduce(m_tensor, op=dist.ReduceOp.SUM)
+                    m_avg = (m_tensor.item() / float(world))
+                    monitored_for_decision = m_avg
+                    if r == 0:
+                        print(f'Synchronized monitored ({args.early_stop_monitor}) = {monitored_for_decision:.6f} (avg across {world} ranks)')
             except Exception:
-                # if anything goes wrong, fall back to local monitored
+                # Fallback: if something goes wrong with collectives, use local value
                 monitored_for_decision = monitored
 
         # early stopping bookkeeping

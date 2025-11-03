@@ -94,7 +94,7 @@ def paper_lines_transform_factory(prob=0.3, line_color=(0, 0, 0), line_opacity=3
 
 def overlay_paper_texture_pil(img, paper_type='white', paper_texture='plain', line_color=(0,0,0), line_opacity=30, line_spacing=28, line_thickness=1, line_jitter=2,
                               paper_strength: Optional[float] = None, paper_yellow_strength: Optional[float] = None, crumple_strength: float = 1.0, crumple_mesh_overlap: int = 1, dot_size: int = 2, dot_opacity_override: Optional[int] = None,
-                              dot_uniform: bool = False, dot_spacing: int = 16):
+                              dot_uniform: bool = False, dot_spacing: int = 16, preserve_line_color: bool = False):
     """Apply a simple paper texture/background to a PIL image.
 
     paper_type: one of 'white', 'yellow-paper', 'dotted' (color and line style)
@@ -191,13 +191,18 @@ def overlay_paper_texture_pil(img, paper_type='white', paper_texture='plain', li
             eff_color = line_color
             eff_opacity = line_opacity
             try:
-                if (isinstance(line_color, tuple) and tuple(line_color) == (0,0,0)) or (isinstance(line_color, (list,)) and tuple(line_color) == (0,0,0)):
+                # Only substitute black -> blue default when caller did not ask to preserve the color
+                if not preserve_line_color and ((isinstance(line_color, tuple) and tuple(line_color) == (0,0,0)) or (isinstance(line_color, (list,)) and tuple(line_color) == (0,0,0))):
                     # caller used default black color; pick a blue-ish default for yellow-lined
                     eff_color = (30, 90, 160)
                 if eff_opacity is None or int(eff_opacity) <= 40:
                     eff_opacity = max(120, int(eff_opacity) if eff_opacity is not None else 140)
             except Exception:
-                eff_color = (30, 90, 160)
+                # respect preserve_line_color on exception: if preserving, keep caller color; otherwise fall back to blue
+                if preserve_line_color:
+                    eff_color = line_color
+                else:
+                    eff_color = (30, 90, 160)
                 eff_opacity = 140
             # reuse the shared overlay function to draw ruled lines on the paper image
             paper = overlay_paper_lines_pil(paper, line_color=eff_color, line_opacity=int(eff_opacity), line_spacing=line_spacing, line_thickness=line_thickness, jitter=line_jitter).convert('RGBA')
@@ -366,12 +371,16 @@ def overlay_paper_texture_pil(img, paper_type='white', paper_texture='plain', li
             eff_color = line_color
             eff_opacity = line_opacity
             try:
-                if (isinstance(line_color, tuple) and tuple(line_color) == (0,0,0)) or (isinstance(line_color, (list,)) and tuple(line_color) == (0,0,0)):
+                # Only substitute black -> blue default when caller did not ask to preserve the color
+                if not preserve_line_color and ((isinstance(line_color, tuple) and tuple(line_color) == (0,0,0)) or (isinstance(line_color, (list,)) and tuple(line_color) == (0,0,0))):
                     eff_color = (30, 90, 160)
                 if eff_opacity is None or int(eff_opacity) <= 40:
                     eff_opacity = max(120, int(eff_opacity) if eff_opacity is not None else 140)
             except Exception:
-                eff_color = (30, 90, 160)
+                if preserve_line_color:
+                    eff_color = line_color
+                else:
+                    eff_color = (30, 90, 160)
                 eff_opacity = 140
             paper = overlay_paper_lines_pil(paper, line_color=eff_color, line_opacity=int(eff_opacity), line_spacing=line_spacing, line_thickness=line_thickness, jitter=line_jitter).convert('RGBA')
         except Exception:

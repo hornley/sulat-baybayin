@@ -32,13 +32,13 @@ class DetectionAugmentation:
         noise_std_range: Tuple[float, float] = (0, 5),
         
         # Lighting parameters
-        shadow_prob: float = 0.3,
+        shadow_prob: float = 0.5,
         shadow_intensity_range: Tuple[float, float] = (0.3, 0.7),
         shadow_size_small_prob: float = 0.4,   # Small shadows
         shadow_size_medium_prob: float = 0.4,  # Medium shadows
         shadow_size_large_prob: float = 0.2,   # Large shadows
         # Probability of using a single large cast shadow (e.g. phone shadow)
-        shadow_single_prob: float = 0.3,
+        shadow_single_prob: float = 0.6,
         overhead_prob: float = 0.2,
         overhead_intensity_range: Tuple[float, float] = (0.1, 0.3),
         spotlight_prob: float = 0.15,
@@ -101,6 +101,8 @@ class DetectionAugmentation:
         self.photometric_prob = photometric_prob
         self.lighting_prob = lighting_prob
         self.geometric_prob = geometric_prob
+        # how many pixels to pad bounding boxes when protecting symbols from shadows
+        self.bbox_shadow_pad = 3
     
     def __call__(
         self, 
@@ -128,7 +130,7 @@ class DetectionAugmentation:
             image = self._apply_photometric(image)
         
         if self.enable_lighting and random.random() < self.lighting_prob:
-            image = self._apply_lighting(image)
+            image = self._apply_lighting(image, bboxes)
         
         if self.enable_geometric and random.random() < self.geometric_prob:
             image, bboxes = self._apply_geometric(image, bboxes)
@@ -178,11 +180,15 @@ class DetectionAugmentation:
         
         return image
     
-    def _apply_lighting(self, image: np.ndarray) -> np.ndarray:
-        """Apply lighting effects."""
+    def _apply_lighting(self, image: np.ndarray, bboxes: np.ndarray) -> np.ndarray:
+        """Apply lighting effects. Protect symbol regions defined by bboxes from shadowing.
+        bboxes: array of shape (N,4) in [x1,y1,x2,y2] absolute pixel coords.
+        """
         h, w = image.shape[:2]
-        
+
         # Shadow casting: either a single large cast (phone-like) or multiple small casts
+        # NOTE: removed bbox protection so shadows may overlap symbols; make shadows
+        # less dark by scaling intensity inside shadow functions.
         if random.random() < self.shadow_prob:
             if random.random() < self.shadow_single_prob:
                 image = self._add_single_cast_shadow(image)
@@ -224,61 +230,60 @@ class DetectionAugmentation:
         return image
     
     def _add_shadow(self, image: np.ndarray) -> np.ndarray:
-        """Add a random shadow cast with size variation."""
+        """Add a random shadow cast with size variation. Shadows now may overlap symbols;
+        make them less dark by scaling intensity down."""
         h, w = image.shape[:2]
         intensity = random.uniform(*self.shadow_intensity_range)
-        
+        # make shadows less dark overall
+        intensity = float(intensity) * 0.6
+
         # Determine shadow size based on probabilities
         size_choice = random.random()
         total_prob = self.shadow_size_small_prob + self.shadow_size_medium_prob + self.shadow_size_large_prob
         norm_small = self.shadow_size_small_prob / total_prob
         norm_medium = self.shadow_size_medium_prob / total_prob
-        
+
         if size_choice < norm_small:
-            # Small shadow (15-35% of image)
             coverage = random.uniform(0.25, 0.45)
         elif size_choice < norm_small + norm_medium:
-            # Medium shadow (35-60% of image)
             coverage = random.uniform(0.45, 0.70)
         else:
-            # Large shadow (60-85% of image)
             coverage = random.uniform(0.70, 0.95)
-        
+
         # Create random polygon for shadow shape
         num_points = random.randint(3, 6)
         points = []
-        
-        # Generate points within a constrained region based on coverage
+
         center_x = random.uniform(0.2, 0.8) * w
         center_y = random.uniform(0.2, 0.8) * h
         radius_x = coverage * w / 2
         radius_y = coverage * h / 2
-        
+
         for _ in range(num_points):
             angle = random.uniform(0, 2 * np.pi)
-            r = random.uniform(0.5, 1.0)  # Vary distance from center
+            r = random.uniform(0.5, 1.0)
             x = int(center_x + r * radius_x * np.cos(angle))
             y = int(center_y + r * radius_y * np.sin(angle))
-            # Clamp to image boundaries
-            x = max(0, min(w, x))
-            y = max(0, min(h, y))
+            x = max(0, min(w - 1, x))
+            y = max(0, min(h - 1, y))
             points.append([x, y])
         points = np.array(points, dtype=np.int32)
-        
-        # Create mask
+
+        # Create mask and fill polygon
         mask = np.zeros((h, w), dtype=np.float32)
         cv2.fillPoly(mask, [points], 1.0)
-        
+
         # Apply Gaussian blur to soften edges (blur amount scales with size)
-        blur_kernel = int(51 * (coverage + 0.3))  # Larger shadows get softer edges
+        blur_kernel = int(51 * (coverage + 0.3))
         if blur_kernel % 2 == 0:
             blur_kernel += 1
+        blur_kernel = max(3, min(blur_kernel, max(h, w) | 1))
         mask = cv2.GaussianBlur(mask, (blur_kernel, blur_kernel), 0)
-        
+
         # Apply shadow
         shadow_factor = 1.0 - (mask * intensity)
         image = image * shadow_factor[:, :, np.newaxis]
-        
+
         return image
 
     def _add_single_cast_shadow(self, image: np.ndarray) -> np.ndarray:
@@ -289,23 +294,42 @@ class DetectionAugmentation:
         """
         h, w = image.shape[:2]
         intensity = random.uniform(*self.shadow_intensity_range)
+        # make cast shadows less dark
+        intensity = float(intensity) * 0.8
 
         # Large coverage for cast shadow (50% - 95% of image)
         coverage = random.uniform(0.5, 0.95)
 
-        # Place the cast shadow toward an edge (phone usually near top/side).
-        center_x = int(random.uniform(0.2, 0.8) * w)
-        center_y = int(random.uniform(0.0, 0.35) * h)
+        # Place the cast shadow near the image center (user requested centered shadows)
+        center_x = int(w / 2)
+        center_y = int(h / 2)
 
         radius_x = int(max(1, coverage * w / 2))
         radius_y = int(max(1, coverage * h / 2))
 
-        # Build mask with filled ellipse
+        # Build mask. Prefer an ellipse, but sometimes simulate a phone/object by
+        # drawing a rotated filled rectangle (phone-like shadow) then softening it.
         mask = np.zeros((h, w), dtype=np.float32)
+        draw_choice = random.random()
         try:
-            cv2.ellipse(mask, (center_x, center_y), (radius_x, radius_y), int(random.uniform(-30, 30)), 0, 360, 1.0, -1)
+            if draw_choice < 0.3:
+                # Elliptical cast (existing behavior)
+                cv2.ellipse(mask, (center_x, center_y), (radius_x, radius_y), int(random.uniform(-30, 30)), 0, 360, 1.0, -1)
+            else:
+                # Phone-like rectangular shadow: draw a rotated rectangle (box) with
+                # an aspect ratio biased toward phone shapes and a randomized angle.
+                # Rectangular size scaled from coverage but keep it narrower/taller than ellipse.
+                # Make rectangle a bit larger than before per user's request
+                rect_w = int(max(1, coverage * w * 1.2))
+                # Make rectangle height a larger fraction of coverage to mimic a bigger phone/object
+                rect_h = int(max(1, coverage * h * random.uniform(0.5, 0.9)))
+                angle = float(random.uniform(-15, 15))
+                # Create rotated rect and fill polygon
+                box = ((int(center_x), int(center_y)), (rect_w, rect_h), angle)
+                pts = cv2.boxPoints(box).astype(np.int32)
+                cv2.fillPoly(mask, [pts], 1.0)
         except Exception:
-            # Fallback: draw a filled circle if ellipse fails
+            # Fallback: draw a filled circle if shape drawing fails
             cv2.circle(mask, (center_x, center_y), max(radius_x, radius_y), 1.0, -1)
 
         # Soften edges: blur amount scales with coverage and image size
