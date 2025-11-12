@@ -73,8 +73,6 @@ def clean_annotations(data_dir, ann_file, out_file=None, do_remove=False, max_li
 
     missing = []
     kept = []
-    # cache resolution results to avoid repeated filesystem checks for duplicate image paths
-    resolved_cache = {}
     header = None
 
     with open(ann_file, 'r', encoding='utf8', newline='') as f:
@@ -97,31 +95,19 @@ def clean_annotations(data_dir, ann_file, out_file=None, do_remove=False, max_li
         if not r:
             continue
         img = r[0]
-        if img in resolved_cache:
-            resolved = resolved_cache[img]
-        else:
-            resolved = resolve_image_path(img, data_dir)
-            resolved_cache[img] = resolved
-
+        resolved = resolve_image_path(img, data_dir)
         if resolved is None:
             missing.append((img, r))
         else:
-            # keep original row; duplicates are preserved
+            # Optionally rewrite the path to the resolved absolute path? We'll keep original path
             kept.append(r)
 
-    total_rows = len(rows) - (1 if has_header_flag else 0)
-    print(f"Checked annotations: {total_rows} rows")
-    print(f"  Missing referenced image rows: {len(missing)}")
-    # summarize unique missing image paths and counts
-    missing_counts = {}
-    for img, _ in missing:
-        missing_counts[img] = missing_counts.get(img, 0) + 1
-    unique_missing = len(missing_counts)
-    if unique_missing > 0:
-        print(f"  Unique missing image paths: {unique_missing}")
-        print('\nSample missing entries (unique):')
-        for i, (img, cnt) in enumerate(list(missing_counts.items())[:max_list]):
-            print(f"  {i+1}. {img}  (rows: {cnt})")
+    print(f"Checked annotations: {len(rows) - (1 if has_header_flag else 0)} rows")
+    print(f"  Missing referenced image files: {len(missing)}")
+    if missing:
+        print('\nSample missing entries:')
+        for i, (img, row) in enumerate(missing[:max_list]):
+            print(f"  {i+1}. {img}")
 
     out_path = None
     if do_remove:
@@ -129,9 +115,10 @@ def clean_annotations(data_dir, ann_file, out_file=None, do_remove=False, max_li
         if out_file:
             out_path = out_file
         else:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             base = os.path.splitext(os.path.basename(ann_file))[0]
-            out_path = os.path.join(os.path.dirname(ann_file), f"{base}_cleaned.csv")
-        
+            out_path = os.path.join(os.path.dirname(ann_file), f"{base}_cleaned_{ts}.csv")
+
         # Write cleaned CSV preserving header if present
         with open(out_path, 'w', encoding='utf8', newline='') as wf:
             writer = csv.writer(wf)

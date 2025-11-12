@@ -832,11 +832,20 @@ def main():
         val_loss = None
         val_map = None
         if args.val_ann:
-            # Run validation only on rank 0 in DDP to avoid duplicate work
+            # By default we run validation on a single rank to avoid duplicate work.
+            # However, running val_map only on rank 0 and then broadcasting can hit
+            # NCCL watchdogs when validation is long. To avoid that, when using DDP
+            # and monitoring 'val_map' we compute val_map on all ranks in parallel
+            # and then average the scalar via all_reduce. This duplicates compute
+            # but avoids hanging collectives.
             do_val = True
             if running_ddp:
                 try:
-                    do_val = (dist.get_rank() == 0)
+                    if args.early_stop_monitor == 'val_map':
+                        # compute val_map on all ranks to avoid rank-0-only broadcast
+                        do_val = True
+                    else:
+                        do_val = (dist.get_rank() == 0)
                 except Exception:
                     do_val = True
             if do_val:
@@ -847,17 +856,35 @@ def main():
                 val_map = None
                 if do_val:
                     val_loader = torch.utils.data.DataLoader(val_ds, **v_dl_kwargs)
-                    model.eval()
+                    # To compute validation loss we need the model to return a loss dict.
+                    # torchvision detection models return losses only when model.training==True.
+                    # So temporarily set the model to train() while computing losses, then
+                    # switch to eval() for any inference (mAP) computations.
                     total_val = 0.0
                     n_val = 0
                     with torch.no_grad():
-                        for imgs, targets in val_loader:
-                            imgs = list(img.to(device) for img in imgs)
-                            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                            loss_dict = model(imgs, targets)
-                            losses = sum(loss for loss in loss_dict.values())
-                            total_val += float(losses.item())
-                            n_val += 1
+                        # temporarily enable training mode so model(images, targets) returns loss dict
+                        was_training = model.training
+                        try:
+                            model.train()
+                            for imgs, targets in val_loader:
+                                imgs = list(img.to(device) for img in imgs)
+                                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                                loss_dict = model(imgs, targets)
+                                # loss_dict should be a dict when model.training is True
+                                if isinstance(loss_dict, list):
+                                    # Defensive: if model still returned detections, skip loss aggregation
+                                    print('Warning: model returned detections during loss computation; skipping val_loss aggregation')
+                                    continue
+                                losses = sum(loss for loss in loss_dict.values())
+                                total_val += float(losses.item())
+                                n_val += 1
+                        finally:
+                            # restore original training/eval state
+                            if was_training:
+                                model.train()
+                            else:
+                                model.eval()
                     if n_val:
                         val_loss = total_val / n_val
                         print(f'Validation: val_loss={val_loss:.4f}')
@@ -905,17 +932,26 @@ def main():
             try:
                 world = dist.get_world_size()
                 r = dist.get_rank()
-                if args.early_stop_monitor in ('val_map', 'val_loss'):
-                    # rank 0 computes the metric (if available); other ranks create
-                    # a placeholder tensor and participate in the broadcast so there
-                    # are no mismatched collectives.
+                if args.early_stop_monitor == 'val_map':
+                    # We compute val_map on all ranks in DDP mode (duplication) and
+                    # then average the scalar with all_reduce so every rank sees the
+                    # same value. This avoids a rank-0-only broadcast that can hang
+                    # when validation is long.
+                    local_val = float(monitored) if monitored is not None else 0.0
+                    m_tensor = torch.tensor(local_val, device=device)
+                    dist.all_reduce(m_tensor, op=dist.ReduceOp.SUM)
+                    m_avg = (m_tensor.item() / float(world))
+                    monitored_for_decision = m_avg
+                    if r == 0:
+                        print(f'Synchronized monitored (val_map) = {monitored_for_decision:.6f} (avg across {world} ranks)')
+                elif args.early_stop_monitor == 'val_loss':
+                    # val_loss may be computed only on rank 0; broadcast from rank 0.
                     local_val = float(monitored) if (r == 0 and monitored is not None) else 0.0
                     m_tensor = torch.tensor(local_val, device=device)
-                    # Broadcast rank-0 value (or 0.0 if rank-0 failed to compute) to all ranks
                     dist.broadcast(m_tensor, src=0)
                     monitored_for_decision = float(m_tensor.item())
                     if r == 0:
-                        print(f'Synchronized monitored ({args.early_stop_monitor}) = {monitored_for_decision:.6f} (broadcast from rank 0)')
+                        print(f'Synchronized monitored (val_loss) = {monitored_for_decision:.6f} (broadcast from rank 0)')
                 else:
                     # Per-process metrics (train_loss, acc) should be averaged across ranks
                     # so each process sees the same global value.

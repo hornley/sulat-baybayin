@@ -3,6 +3,14 @@ import torch
 import os
 from PIL import Image, ImageDraw
 from src.detection.dataset import BBoxDataset
+import itertools
+import re
+
+# Optional OpenAI integration (module may be missing at runtime)
+try:
+    import openai
+except Exception:
+    openai = None
 
 
 def generate_output_dir(checkpoint_path, base_dir='detections'):
@@ -69,7 +77,8 @@ def load_checkpoint(path, device='cpu'):
 
 
 def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
-                     y_thresh_mult=0.5, x_thresh_mult=0.6, min_thresh_px=10):
+                     y_thresh_mult=0.5, x_thresh_mult=0.6, min_thresh_px=10,
+                     max_symbol_width_mult=1.6):
     img = Image.open(img_path).convert('RGB')
     import torchvision.transforms as T
     tensor = T.ToTensor()(img).to(device)
@@ -117,11 +126,37 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
             draw.text((x1 + text_offset, y1 + text_offset), text, fill='red')
         preds.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'xc': xc, 'yc': yc, 'w': w, 'h': h, 'label': cname, 'score': float(score)})
 
-    # If no preds, return empty structures (6-tuple)
+    # If no preds, return empty structures (7-tuple)
     if not preds:
-        return img, [], '', [], [], []
+        return img, [], '', [], [], [], []
 
     # compute average sizes to set clustering thresholds
+    avg_h = sum(p['h'] for p in preds) / len(preds)
+    avg_w = sum(p['w'] for p in preds) / len(preds)
+
+    # Detect and remove invalid detections: boxes that are much wider than
+    # the average symbol width (likely contain two symbols). These will be
+    # excluded from clustering and from the final sentence permutations.
+    invalid_boxes = []
+    filtered_preds = []
+    for p in preds:
+        if p['w'] > max_symbol_width_mult * avg_w:
+            p_copy = p.copy()
+            p_copy['reason'] = f'width>{max_symbol_width_mult}x_avg'
+            invalid_boxes.append(p_copy)
+        else:
+            filtered_preds.append(p)
+
+    # If after filtering there are no valid preds, return but include invalids
+    if not filtered_preds:
+        flat_invalid = sorted(invalid_boxes, key=lambda x: (x['yc'], x['xc']))
+        preds_sorted_invalid = [(v['x1'], v['label'], v['score']) for v in flat_invalid]
+        return img, preds_sorted_invalid, '', [], [], flat_invalid, invalid_boxes
+
+    # use filtered preds for the remainder of the pipeline
+    preds = filtered_preds
+
+    # recompute averages using filtered preds
     avg_h = sum(p['h'] for p in preds) / len(preds)
     avg_w = sum(p['w'] for p in preds) / len(preds)
 
@@ -139,6 +174,13 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
 
     # within each line, cluster by x to form symbol positions (left->right)
     import itertools
+    import re
+
+    # Optional OpenAI integration
+    try:
+        import openai
+    except Exception:
+        openai = None
     all_line_permutations = []  # list of lists-of-candidate-labels per line
     annotated_positions = []
     for line in lines:
@@ -167,11 +209,40 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
     # produce sentence permutations: Cartesian product of choices per position within each line,
     # then join lines top->down with ' <NL> '
     line_permutation_strings = []  # list of lists (each list contains permutations for that line)
-    for line_choices in all_line_permutations:
+    # Also compute per-line position centers for spacing decisions
+    per_line_centers = []
+    for line_idx, line_choices in enumerate(all_line_permutations):
+        # compute centers for this line positions from annotated_positions
+        centers = []
+        for pos in annotated_positions[line_idx]:
+            # representative center for this position: mean of candidate x-centers
+            mean_x = sum([c['xc'] for c in pos]) / len(pos)
+            centers.append(mean_x)
+        per_line_centers.append(centers)
+
         # line_choices: list of lists of labels for that line positions
-        # produce all combinations for this line
         combos = list(itertools.product(*line_choices)) if line_choices else [()]
-        line_strings = [' '.join(c) for c in combos]
+        line_strings = []
+        # decide separator threshold to mark an inter-word gap (larger than clustering threshold)
+        sep_threshold = 1.8 * max(x_thresh_mult * avg_w, min_thresh_px)
+        for combo in combos:
+            # build string by concatenating symbols within a word (no separator), and
+            # inserting a single space between positions whose center gap exceeds sep_threshold
+            pieces = []
+            for pi, token in enumerate(combo):
+                pieces.append(token)
+            if len(centers) <= 1:
+                # single position, just use the token
+                line_strings.append(''.join(pieces))
+            else:
+                s = ''
+                for i, tok in enumerate(pieces):
+                    s += tok
+                    if i < len(centers) - 1:
+                        gap = centers[i+1] - centers[i]
+                        if gap > sep_threshold:
+                            s += ' '
+                line_strings.append(s)
         line_permutation_strings.append(line_strings)
 
     # Now combine lines (top->down). For each combination pick one permutation per line and join with ' <NL> '
@@ -232,7 +303,9 @@ def draw_predictions(img_path, model, classes, device='cpu', thresh=0.5,
     flat_preds_sorted = sorted(preds, key=lambda x: (x['yc'], x['xc']))
     preds_sorted = [(p['x1'], p['label'], p['score']) for p in flat_preds_sorted]
 
-    return img, preds_sorted, best_sentence, overall_sentences, annotated_positions, flat_preds_sorted
+    # Always return invalid_boxes as the final element so callers can log or inspect
+    # any detections that were filtered out earlier (e.g. boxes that were too wide).
+    return img, preds_sorted, best_sentence, overall_sentences, annotated_positions, flat_preds_sorted, invalid_boxes
 
 
 def main():
@@ -243,10 +316,14 @@ def main():
     parser.add_argument('--thresh', type=float, default=0.5)
     parser.add_argument('--no-permutations', action='store_true', help='Do not write all permutations to per-image txt')
     parser.add_argument('--global-format', choices=['txt', 'csv', 'json'], default='txt', help='Format for global predictions file')
+    parser.add_argument('--use-openai', action='store_true', help='Call OpenAI to identify Tagalog words from permutations (requires OPENAI_API_KEY)')
+    parser.add_argument('--openai-model', default='gpt-4o-mini', help='OpenAI model to use (default: gpt-4o-mini)')
+    parser.add_argument('--openai-key', default=None, help='OpenAI API key (optional, overrides OPENAI_API_KEY env var)')
     parser.add_argument('--y-thresh-mult', type=float, default=0.5, help='Multiplier for y clustering threshold (relative to avg height)')
     parser.add_argument('--x-thresh-mult', type=float, default=0.6, help='Multiplier for x clustering threshold (relative to avg width)')
     parser.add_argument('--min-thresh-px', type=int, default=10, help='Minimum pixel threshold for clustering')
     parser.add_argument('--compile-inferred', action='store_true', help='Produce a single compiled inferred text file (compiled_inferred.txt) instead of separate per-image inference txts')
+    parser.add_argument('--max-symbol-width-mult', type=float, default=1.6, help='Max allowed symbol box width as multiple of avg symbol width; wider boxes are marked invalid')
     args = parser.parse_args()
     
     # Auto-generate output directory if not provided
@@ -267,26 +344,28 @@ def main():
     # global predictions file
     global_preds_path = os.path.join(args.out, 'predictions.txt')
     # prepare global predictions writer depending on format
-    import json, csv
+    import json, csv, re
     if args.global_format == 'txt':
-        gfh = open(global_preds_path, 'w', encoding='utf8')
-        write_global = lambda name, sent: gfh.write(f"{name}\t{sent}\n")
+        # accumulate entries and write at the end so we can place a summary at the top
+        g_entries = []
+        write_global = lambda name, sent, openai_resp, recon: g_entries.append({'image': name, 'best_sentence': sent, 'openai': openai_resp, 'openai_reconstructed': recon})
     elif args.global_format == 'csv':
         gfh = open(global_preds_path, 'w', encoding='utf8', newline='')
         gcsv = csv.writer(gfh)
-        gcsv.writerow(['image', 'best_sentence'])
-        write_global = lambda name, sent: gcsv.writerow([name, sent])
+        gcsv.writerow(['image', 'best_sentence', 'openai_response', 'openai_reconstructed'])
+        write_global = lambda name, sent, openai_resp, recon: gcsv.writerow([name, sent, openai_resp, recon])
     else:
         # json: accumulate and write at the end
         g_entries = []
-        write_global = lambda name, sent: g_entries.append({'image': name, 'best_sentence': sent})
+        write_global = lambda name, sent, openai_resp, recon: g_entries.append({'image': name, 'best_sentence': sent, 'openai': openai_resp, 'openai_reconstructed': recon})
 
     compiled_entries = []
     compiled_annotations = []
     for p in paths:
-        img_out, preds_sorted, best_sentence, overall_sentences, annotated_positions, raw_preds = draw_predictions(
+        img_out, preds_sorted, best_sentence, overall_sentences, annotated_positions, raw_preds, invalid_boxes = draw_predictions(
             p, model, classes, device=device, thresh=args.thresh,
-            y_thresh_mult=args.y_thresh_mult, x_thresh_mult=args.x_thresh_mult, min_thresh_px=args.min_thresh_px
+            y_thresh_mult=args.y_thresh_mult, x_thresh_mult=args.x_thresh_mult, min_thresh_px=args.min_thresh_px,
+            max_symbol_width_mult=getattr(args, 'max_symbol_width_mult', 1.6)
         )
         out_img_path = os.path.join(args.out, os.path.basename(p))
         img_out.save(out_img_path)
@@ -294,6 +373,129 @@ def main():
         # write per-image text file with label and score
         base = os.path.splitext(os.path.basename(p))[0]
         txt_path = os.path.join(args.out, base + '.txt')
+        # Expand vowel permutations (i -> [i,e], u -> [u,o]) for all overall permutations
+        def expand_vowel_permutations_sentence(s):
+            # s may contain ' <NL> ' joins for lines
+            lines = s.split(' <NL> ')
+            expanded_lines = []
+            for line in lines:
+                tokens = [t for t in line.split(' ') if t != '']
+                # per-token alternatives
+                alt_lists = []
+                for tok in tokens:
+                    m = re.match(r"^([b-df-hj-np-tv-z])(i|u)$", tok, flags=re.IGNORECASE)
+                    if m:
+                        cons = m.group(1)
+                        vow = m.group(2).lower()
+                        if vow == 'i':
+                            alts = [cons + 'i', cons + 'e']
+                        else:
+                            alts = [cons + 'u', cons + 'o']
+                        alt_lists.append(alts)
+                    else:
+                        alt_lists.append([tok])
+                # Cartesian product
+                if alt_lists:
+                    combos = list(itertools.product(*alt_lists))
+                    expanded = [''.join(c) for c in combos]
+                else:
+                    expanded = ['']
+                expanded_lines.append(expanded)
+            # combine lines back with ' <NL> '
+            combined = []
+            for prod in itertools.product(*expanded_lines):
+                combined.append(' <NL> '.join(prod))
+            return combined
+
+        # Prepare expanded permutations for OpenAI
+        expanded_permutations = []
+        for s in overall_sentences:
+            expanded_permutations.extend(expand_vowel_permutations_sentence(s))
+
+        # OpenAI call (optional): supports new openai.OpenAI client and falls back to legacy ChatCompletion
+        def call_openai_identify_tagalog(candidates, model_name='gpt-4o-mini', api_key=None):
+            if not args.use_openai:
+                return 'OPENAI_DISABLED'
+            if openai is None:
+                return 'OPENAI_PYTHON_NOT_INSTALLED'
+            key = api_key if api_key else os.environ.get('OPENAI_API_KEY')
+            if not key:
+                return 'OPENAI_API_KEY_NOT_SET'
+
+            # Include original best sentence as an extra candidate so concatenations
+            # such as 'miss' (from 'mi s s') appear in the prompt explicitly.
+            extra_info = ''
+            if hasattr(args, 'best_sentence') and args.best_sentence:
+                extra_info = '\nOriginalBestSentence:\n' + args.best_sentence + '\n'
+
+            prompt = (
+                'You are given a list of candidate word/phrase permutations (possible Filipino/Tagalog words).'
+                ' From these candidates, identify which individual tokens are valid Filipino/Tagalog words.'
+                ' Return a JSON object with three keys: "tagalog" (array of unique Tagalog words found),'
+                ' "others" (array of other candidate words found), and "reconstructed" (a best-effort reconstructed'
+                ' full sentence combining tokens). Do not include any extra commentary; output only valid JSON.'
+                f"\n\nCandidates:\n" + '\n'.join(candidates[:200]) + extra_info
+            )
+
+            messages = [
+                {'role': 'system', 'content': 'You are a helpful language assistant who only outputs JSON.'},
+                {'role': 'user', 'content': prompt}
+            ]
+
+            try:
+                # Prefer new 1.x style client if available
+                if hasattr(openai, 'OpenAI'):
+                    try:
+                        client = openai.OpenAI(api_key=key)
+                    except TypeError:
+                        # some versions accept no arg and use env var
+                        client = openai.OpenAI()
+                        try:
+                            client.api_key = key
+                        except Exception:
+                            pass
+                    try:
+                        resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.0, max_tokens=600)
+                        # Attempt to extract assistant content
+                        choice = resp.choices[0]
+                        text = None
+                        if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                            text = choice.message.content
+                        elif isinstance(choice, dict) and 'message' in choice and 'content' in choice['message']:
+                            text = choice['message']['content']
+                        else:
+                            text = str(choice)
+                        return text.strip() if text else ''
+                    except Exception as e:
+                        return f'OPENAI_ERROR: {e}'
+
+                # Fallback: legacy ChatCompletion API
+                if hasattr(openai, 'ChatCompletion'):
+                    try:
+                        openai.api_key = key
+                        resp = openai.ChatCompletion.create(model=model_name, messages=messages, temperature=0.0, max_tokens=600)
+                        return resp['choices'][0]['message']['content'].strip()
+                    except Exception as e:
+                        return f'OPENAI_ERROR: {e}'
+
+                return 'OPENAI_UNSUPPORTED_CLIENT'
+            except Exception as e:
+                return f'OPENAI_ERROR: {e}'
+
+        # attach best_sentence to args for the helper to include it in the prompt
+        args.best_sentence = best_sentence
+        openai_response = call_openai_identify_tagalog(expanded_permutations, model_name=args.openai_model, api_key=args.openai_key)
+
+        # try to parse JSON response to extract reconstructed sentence (if model followed JSON instruction)
+        openai_reconstructed = ''
+        try:
+            parsed = json.loads(openai_response)
+            if isinstance(parsed, dict):
+                openai_reconstructed = parsed.get('reconstructed') or parsed.get('best_sentence') or parsed.get('sentence') or ''
+        except Exception:
+            # not JSON or parse failed; leave reconstructed empty
+            openai_reconstructed = ''
+
         with open(txt_path, 'w', encoding='utf8') as fh:
             for x1, cname, score in preds_sorted:
                 fh.write(f"{cname}\t{score:.4f}\n")
@@ -301,6 +503,15 @@ def main():
             fh.write('BEST_SENTENCE:\n')
             fh.write(best_sentence + '\n')
             fh.write('\n')
+            fh.write('OPENAI_RESPONSE:\n')
+            fh.write(openai_response + '\n')
+            fh.write('\n')
+            # list invalid/removed boxes (if any)
+            if invalid_boxes:
+                fh.write('INVALID_BOXES:\n')
+                for ib in invalid_boxes:
+                    fh.write(f"  {ib['x1']:.1f},{ib['y1']:.1f},{ib['x2']:.1f},{ib['y2']:.1f}\t{ib['label']}\t{ib['score']:.4f}\t{ib.get('reason','')}\n")
+                fh.write('\n')
             if not args.no_permutations:
                 fh.write('PERMUTATIONS:\n')
                 for s in overall_sentences:
@@ -313,8 +524,8 @@ def main():
                 for pi, pos in enumerate(line):
                     labels = [pp['label'] for pp in sorted(pos, key=lambda r: r['score'], reverse=True)]
                     fh.write(f'  Pos {pi+1}: ' + ','.join(labels) + '\n')
-        # append to global predictions file / structure
-        write_global(os.path.basename(p), best_sentence)
+        # append to global predictions file / structure (include openai response if available)
+        write_global(os.path.basename(p), best_sentence, openai_response, openai_reconstructed)
         # optionally aggregate into a compiled inferred file content
         if args.compile_inferred:
             # we will append a block per image to compiled_entries
@@ -327,12 +538,24 @@ def main():
                     'label': det.get('label'), 'score': det.get('score')
                 })
 
-    # finalize json if needed
+    # finalize global predictions file
     if args.global_format == 'json':
         with open(global_preds_path, 'w', encoding='utf8') as gj:
             json.dump(g_entries, gj, ensure_ascii=False, indent=2)
-    else:
+    elif args.global_format == 'csv':
         gfh.close()
+    else:
+        # txt: write a summary of unique words at the top, then per-image rows
+        # Write a concise summary at the top: image -> reconstructed (fallback to best_sentence)
+        with open(global_preds_path, 'w', encoding='utf8') as gfh_out:
+            gfh_out.write('SUMMARY (image -> reconstructed):\n')
+            for e in g_entries:
+                recon = e.get('openai_reconstructed') or e.get('best_sentence') or ''
+                gfh_out.write(f"{e['image']} -> {recon}\n")
+            gfh_out.write('\n')
+            # now write per-image tab-separated rows for more detail
+            for e in g_entries:
+                gfh_out.write(f"{e['image']}\t{e['best_sentence']}\t{e['openai']}\t{e['openai_reconstructed']}\n")
     # write compiled inferred file if requested
     if args.compile_inferred:
         compiled_path = os.path.join(args.out, 'compiled_inferred.txt')
